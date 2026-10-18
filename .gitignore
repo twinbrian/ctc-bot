@@ -1,0 +1,9 @@
+# rebuilt from history/ by analysis/build_all.py (too big for GitHub)
+analysis/cache.pkl
+analysis/storm_tensors.npz
+# written by the running bot
+bot/logs/
+bot/state.json
+bot/control.json
+__pycache__/
+.DS_Store
