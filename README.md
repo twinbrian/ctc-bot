@@ -1,3 +1,5 @@
+> **Our trading bot, monitor and open questions (including how to handle announcements): see [`bot/README.md`](bot/README.md).** Research notes: [`analysis/FINDINGS.md`](analysis/FINDINGS.md). The rest of this file is the organizers' data dictionary.
+
 # Hurricane Season research data
 
 This folder contains past hurricane seasons of the Archipelago. Use them to make and test your

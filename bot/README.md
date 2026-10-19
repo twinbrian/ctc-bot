@@ -3,9 +3,10 @@
 Trades the edges in `analysis/FINDINGS.md` on the Cornell Trading Competition exchange
 (`https://cornelltradingcompetition.org`, the same site as the web terminal):
 
-- **In-storm model.** At storm ages 10, 30, …, 470 s it predicts how far the house price will move by
-  the end of the storm. The bot works toward the full position limit in that direction, paying at
-  most mid + half the predicted move per share. It flattens when the storm dissipates.
+- **In-storm model.** Every 20 s from storm age 30 s to 470 s, it predicts how far the house price will
+  move by the end of the storm. If 70% of that move clears 1% of the price, the bot works toward the full
+  position limit in that direction, paying at most mid + 70% of the predicted move − 1% of price per share.
+  In rounds 1–2 it flattens when the storm dissipates; in round 3 it holds to settlement.
 - **Round-3 final report.** The final damage report fixes every settlement exactly. The bot takes
   every resting order on the wrong side of value ± a safety margin, then holds to settlement.
 
@@ -18,11 +19,12 @@ the storms still to come.
 
 | | Rounds 1–2 | Round 3 |
 |---|---|---|
-| During the storm (ages 10–470 s) | Full position limit toward the predicted house move, paying ≤ half the predicted move | same |
+| During the storm (ages 30–470 s) | Full position limit toward the predicted house move, paying ≤ 70% of it − 1% of price; no flips | same |
 | Storm ends | Close at the model's fair value (± half-spread + 0.15%); never chase a runaway book | **Hold**: no later storm to carry risk into |
-| Damage reports | Re-close leftovers within 0.3% of mid | Final report: exact settlement values; take mispriced quotes, hold everything to settlement |
+| Damage reports | Re-close leftovers within 0.3% of mid, retried from the current mid every 20 s until flat | Final report: exact settlement values; take mispriced quotes, hold everything to settlement |
 
-The policy was chosen on 100 held-out seasons with storm-time book depth (`bot/compare_variants.py`):
+The policy was chosen on 100 held-out seasons with storm-time book depth (`bot/compare_variants.py`), using the
+earlier settings (the absolute numbers are lower than today's; the ranking is what mattered):
 
 | Policy | Mean per season | Profitable seasons |
 |---|---|---|
@@ -184,13 +186,15 @@ ledger). Rounds now run from season reset to season reset. Fills are also reconc
 positions: a restart's position snapshot, or a gap that lasts 3 status lines, is booked as an
 "unlogged fill" anomaly.
 
-**Audit after the fix (34 live rounds, 11 complete seasons 71–81):**
-- 9 of 11 seasons positive. Season 79 (−$7.0k) and season 80 (−$16.4k) were negative; the honest replays
-  of the same seasons lost about the same (−$6.3k and −$16.1k).
-- All 8 rounds below −$3k were **VARIANCE**. The worst was season 80 r2 Wren: −$18.1k live vs −$18.6k
-  in replay (a direct hit that turned erratically mid-storm).
-- Live beat the replay overall: +$34.6k vs +$24.4k.
-- The only persistent gap is **PORT: −$5.5k over 34 rounds (about −$160/round)** worse live (thin book).
+**Live record (48 rounds, 16 complete testnet seasons 71–86, as of 2026-10-18 20:00):**
+- 13 of 16 seasons positive. Live +$76.3k vs +$61.5k for the honest replay of the same seasons.
+- On the current settings (seasons 80–86): 5 of 7 positive, live +$31.2k vs replay +$28.3k.
+- All 4 rounds below −$5k were **VARIANCE**: the honest replay of the same storm lost about as much. The
+  worst was season 80 r2 Wren (−$18.1k live vs −$18.6k replay, a direct hit that turned erratically) and
+  season 84 r2 Lena (−$7.9k: advisories said 98–100% Cascadia Prime and the storm missed).
+- The only persistent gap is **PORT: −$3.0k over 48 rounds (about −$60/round)** worse live (thin book).
+- **These testnet numbers are optimistic.** `models.pkl` is trained on all 600 research seasons, which include
+  the seasons the testnet replays. Competition storms are new, so expect the held-out figures below.
 - The dashboard often shows a negative total mid-season because rounds 1–2 are frequently negative,
   while round 3 (held to settlement) is usually strongly positive.
 
@@ -201,7 +205,7 @@ positions: a restart's position snapshot, or a gap that lasts 3 status lines, is
 - **Stricter PORT entry / no PORT** (`bot/port_variants.py`; 200 held-out seasons, paired against
   production): a PORT buffer of 2% changes PnL by −$26 ± 48 per season, 3% by −$121 ± 71, and dropping
   PORT by −$1,225 ± 166. PORT earns about $1,300/season in replay, well above its live gap (about
-  $480/season), so PORT stays at the 1% buffer.
+  $190/season), so PORT stays at the 1% buffer.
 - A **round stop-loss** (−$3k / −$5k) is off. It lowered mean profit and the share of profitable
   seasons, and did not reduce the worst rounds, because big losses come from sudden repricings.
 
@@ -222,7 +226,9 @@ feed snapshot, and detects a new season by competition id or by a jump in the ma
 
 - **Web terminal:** your team's positions and PnL. This is authoritative.
 - **Console:** a `STATUS` line every 10 s with positions, the season PnL from the exchange's own fills
-  (`GET /api/v1/trades`, undocumented but works), and the exchange's unrealized PnL.
+  (`GET /api/v1/trades`, undocumented but works), and the exchange's unrealized PnL. This PnL can show
+  phantom swings for a few seconds during fast trading (positions update before fill prices arrive); the
+  monitor's numbers do not.
 - **Results:** `ROUND RESULT` and `SEASON RESULT` lines; print them with `$PY -I bot/summary.py`. After a
   restart the bot only knows PnL since the restart (profit realized earlier is on the website).
 - **Order log:** `bot/logs/run-*.jsonl` has every decision (predictions and goals), order, cancel,
@@ -253,10 +259,10 @@ feed snapshot, and detects a new season by competition id or by a jump in the ma
   - Depth within 1% of the best price falls about 30% during storms. PORT is about 94 shares and
     HAVEN about 103; the rest range up to about 380.
   - The book refreshes every ~4 s, which is why the broker works each goal in pieces.
-- **Realistic expectation.** The 100 held-out research seasons, filling against storm-time book
-  depth, average about **$5.7k per season, profitable in 70% of seasons** (about $5.1k in-storm and
-  $0.6k from the final report). With unlimited depth at the touch it would be about $14k, so depth is
-  the binding constraint. Extra bot keys and patient execution are the main levers.
+- **Realistic expectation (current settings, storms the model never saw, live-calibrated costs):**
+  $9.0k per season and 88% profitable on seasons 401–600, and $7.8k and 82% on seasons 61–160. A single
+  season swings by roughly ±$8.5k, so one season can lose even when everything works. Depth is the
+  binding constraint (with unlimited depth at the touch it would be about twice as much).
 
 ## Live testnet results (2026-10-18)
 
@@ -266,8 +272,8 @@ feed snapshot, and detects a new season by competition id or by a jump in the ma
 | 66–69 | partial | The Mac slept and froze the bot for 13–18 minutes at a time, so whole storms were missed. The bot then correctly stopped in-storm trading for those seasons. Season 69 round 1 alone was about +$11.7k. |
 | **70** | **+$29,663** | First clean season on the final code: round 1 +$10,237, round 2 +$4,559, round 3 held to settlement ≈ +$14,900. 0 rejected orders, 0 errors, 0 disconnects. |
 
-One season is one draw; the honest long-run expectation is the replay figure, about $5.7k/season and
-profitable ~72% of the time.
+These early seasons ran older code and settings. For the full day's record, see the live record under
+"Round monitor"; for what to expect in the competition, see "Realistic expectation".
 
 **Bugs found by running live, all fixed:**
 
@@ -307,7 +313,11 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 | `engine.py` | Live features, identical to the research features (`replay.py --parity`) |
 | `train.py` | `models.pkl` (all 600 seasons) and `models_holdout100.pkl` (seasons 1–500, for honest replays) |
 | `replay.py` | Runs research seasons through the same code (`--book` for realistic depth) |
-| `book_profile.py` | Depth model from recorded books |
+| `book_profile.py` | Depth model from recorded books (it grows as more books are recorded, so replay results drift slightly over time) |
+| `monitor.py` | Round reports, live alerts and their diagnosis (see "Round monitor") |
+| `watch.py` | The monitor's live PnL engine, alert rules and diagnosis |
+| `test_fake_exchange.py` | End-to-end checks of strategy + broker against an in-memory exchange (19 checks) |
+| `port_variants.py`, `cost_variants.py`, `compare_variants.py` | Held-out tests of strategy variants |
 
 ## Not in v1
 
@@ -315,5 +325,94 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 - the dissipation and prelim trades
 - final-report trades in rounds 1–2
 - the opening fade
-- announcement handling (it logs `ANNOUNCEMENT` and does nothing). In the live event, read the
-  headline and change the matching constant in `analysis/value.py`.
+- announcement handling beyond the pause and the follower: see "Announcements" below
+
+## Announcements: open question, input wanted
+
+**What the case packet says**
+- An announcement "changes the economics of a company from that time" (§2), at any time in the season
+  (§4). The message names the affected companies in `symbols` (appendix). It does **not** give the
+  direction, the size, or the effect on related companies; the headline is free text.
+- The house "reacts slowly. After an announcement, it takes about 45 real seconds to adjust fully" (§5).
+- The research data and the testnet have **no** announcements (§6, §7; none in our 18,584 recorded feed
+  messages either). We have zero real examples, so everything below is tested only on the fake exchange.
+
+**What the bot does today** (`strategy.py`, `on_news`)
+1. **Pause.** It stops trading the named stocks, and any ETF that contains them, for the rest of the season.
+   That covers in-storm trading and the round-3 final-report trade. Positions are held. Only
+   `{"resume": [...]}` restarts them. If no named symbol is recognized, it pauses everything.
+2. **Follower.** It watches the house price for 6 s. If the price moved at least 0.75%, it trades half the
+   position limit in that direction, paying at most one more "first move". It exits 50 s after the
+   announcement, or sooner if the price gives back half of the first move. It does not read the headline.
+   `{"halt": true}` stops it.
+
+**Known problems with today's behavior**
+- **Oversized trades.** If the bot already holds the stock, the follower can trade up to 1.5× the limit. For
+  example, long 600 GEN becomes short 300, a 900-share sale through a book that is moving on the news.
+- **Stale exit.** The follower's exit returns to the pre-announcement position, which is a bet made with
+  the old economics.
+- **Knock-on effects are missed.** For example, "GRID buries its power lines" helps GRID but hurts GEN (fewer
+  outages), RECON (less repair work) and HAVEN (fewer insured losses). The announcement may name only GRID.
+
+**Why a paused stock can't simply resume next round.** The house's *price* adjusts within about 45 s, but our
+*valuation formula* for the company does not. The formula was fitted to the 600 research seasons
+(`analysis/value.py`). The model trades on the gap between that formula and the house price, so an
+unadjusted formula shows a phantom mispricing in every storm. The round-3 final-report trade then bets the
+full limit on it.
+- **A one-time hit.** "GEN pays a $3 fine": the house drops GEN by $3 and the formula doesn't. The bot thinks
+  GEN is $3 cheap and buys up to 600 shares, about −$1,800 if held to settlement.
+- **A change in how the company reacts to storms.** "GEN can supply only half its generators": no single
+  shift of the formula fixes this.
+
+**Proposal under discussion (Brian)**
+1. On an announcement, pause the stock automatically, and probably the ETF that holds it. The bot already
+   does this.
+2. A human reads the headline and trades the stock by hand for the rest of that round, deciding direction,
+   size and any knock-on stocks.
+3. Turn the algorithm back on for that stock in a later round, or whenever the humans judge the news is
+   absorbed.
+
+**Claude's assessment.** The structure is good. Humans read a headline, its direction and its knock-on
+effects better than the bot, and the algorithm keeps trading every other stock. These additions would
+make it safe:
+- **Re-anchor on resume.** On `{"resume": ["GEN"]}`, the bot should measure how far the house moved relative
+  to our formula across the announcement, and shift the formula by that amount for the rest of the season.
+  This fixes one-time hits exactly; for changes in storm sensitivity it is only approximate.
+- **Skip the round-3 final-report trade for an announced stock** (and its ETF) unless a human is confident of
+  the new value. It is the full-limit bet that depends most on an exact formula.
+- **Manual positions carry over.** Resuming hands the algorithm whatever position the humans hold, and it
+  trades from there. For example, if you are short 300 GEN and the model wants long 600, it buys 900.
+- **Keep the follower only as a fallback** for when nobody is at the keyboard. Fix its problems first: at
+  most half the limit measured from flat, and exit to flat.
+- **Pausing the ETF is sensible and cheap.** An ETF's value is its basket, so a wrong component value makes it
+  wrong, diluted by the component's weight (table below). The bot trades ETFs only in the round-3
+  final-report trade, and they earn little (ARCH about $86 and REBLD about $36 per season).
+
+**What pausing a stock gives up.** Average profit per season, current settings, 200 unseen seasons
+(total $9,007):
+
+| HAVEN | PORT | FERRY | GRID | RECON | AQUA | GEN | ISLE | MAT |
+|---|---|---|---|---|---|---|---|---|
+| $2,481 | $1,311 | $1,157 | $985 | $780 | $635 | $595 | $554 | $368 |
+
+**ETF weights at the starting prices.**
+- ARCH: PORT 25%, AQUA 19%, ISLE 17%, HAVEN 14%, GRID 13%, FERRY 12%.
+- REBLD: RECON 48%, MAT 33%, GEN 19%.
+
+**Questions for reviewers**
+1. During the announcement round: manual trading, the automatic follower, or both?
+2. When to resume the algorithm on that stock: automatically next round (with re-anchoring), or only by hand?
+3. The round-3 final-report trade for an announced stock: skip it, or allow it with the re-anchored value?
+4. Pause the ETF too? Pause obvious knock-on stocks automatically (for example, a GRID announcement also
+   pauses GEN and RECON), or leave that to the humans?
+5. Follower size: half the limit, full, or off?
+
+## Before the competition
+
+- **Keys.** Rotate the bot API key, because the testnet key was pasted into a chat. Create the competition
+  key, and set it as `HURRICANE_BOT_KEY`. Optionally add `HURRICANE_EXTRA_KEYS` for more order throughput.
+- **Endpoint.** Confirm the competition endpoint (the testnet ran on `cornelltradingcompetition.org`).
+- **Announcements.** Decide the announcement policy (above).
+- **Machine.** Run on a machine that stays awake, plugged in and online, or on a server. Start the bot
+  before round 1 under `caffeinate -is`, and start the monitor.
+- **Expectations.** Expect the held-out figures, not the testnet's (see "Realistic expectation").
