@@ -49,7 +49,12 @@ from watch import Data, live_watch, records, _book, _feed, reconcile, exec_time
 
 LOGS = ROOT / "bot" / "logs"
 BAD = -5000.0                     # a round worse than this is investigated (same materiality as the live watch)
+# formation sleeve (live since 2026-10-19). Backtest on 94 recorded live rounds: its own PnL +$311/round (se 38),
+# worst round -$392. Alert on a round below SLEEVE_BAD, and when SLEEVE_MIN_N+ live rounds average below 0 (the
+# agreed signal to switch it off: {"sleeve": 0} in bot/control.json). Details: bot/sleeve_report.py
+SLEEVE_BAD, SLEEVE_MIN_N = -1000.0, 15
 SY = ["PORT", "ISLE", "AQUA", "GRID", "FERRY", "RECON", "MAT", "GEN", "HAVEN", "REIN", "ARCH", "REBLD"]
+STORM_9 = SY[:9]                                   # the stocks the in-storm model and the formation sleeve trade
 HONEST = [(61, 160, ROOT / "bot" / "models_holdout_61_160.pkl"), (401, 500, ROOT / "bot" / "models_holdout_401_500.pkl"),
           (501, 600, ROOT / "bot" / "models_holdout100.pkl")]
 ANOMALIES = ("ORDER REJECTED", "DISCONNECTED", "error", "SNIPE", "ANNOUNCEMENT - PAUSED", "PREDICTION REJECTED (implausible)",
@@ -63,6 +68,8 @@ SETTINGS = [
     ("2026-10-18 14:12", dict(BUFFER=0.01,  EDGE_SHARE=0.5, allow_flip=False, min_age=30)),
     ("2026-10-18 14:27", dict(BUFFER=0.01,  EDGE_SHARE=0.7, allow_flip=False, min_age=30)),
 ]
+# (the formation sleeve, live since 2026-10-19 16:38, is not a replay setting: the replays don't run it, and the verdict
+#  compares live minus the sleeve with them)
 
 
 def alert(msg):
@@ -127,7 +134,7 @@ def bot_ledger(ledger, rnd, name, t0, t1, w1, restarts):
 def live_rounds(since="run-20261018-065413"):
     """Completed live rounds with exact PnL by symbol and the inputs of the diagnosis, from the bot's logs."""
     runs = [f for f in sorted(glob.glob(str(LOGS / "run-*.jsonl"))) if Path(f).name >= since + ".jsonl"]
-    timeline, forms, notes, restarts, decisions, ledger = [], [], collections.defaultdict(list), [], [], []
+    timeline, forms, notes, restarts, decisions, ledger, sleeve_marks = [], [], collections.defaultdict(list), [], [], [], []
     for f in runs:
         recs = records(f)
         if not recs:
@@ -147,14 +154,18 @@ def live_rounds(since="run-20261018-065413"):
             elif e == "storm_formed": forms.append(r["ts"])
             elif e == "decision": decisions.append((r["ts"], r.get("goals") or {}))
             elif e in ("ROUND RESULT", "SEASON RESULT"): ledger.append((r["ts"], e, r))
+            elif e == "FORMATION SLEEVE entry": sleeve_marks.append(r["ts"])
             if e in ANOMALIES: notes[e].append(r["ts"])
         timeline.append((t_start + 1.0, "startup", snap))
-    ident, storms = [], collections.defaultdict(lambda: {"obs": {}, "impacts": set(), "reports": {}})
+    ident, storms, opens = [], collections.defaultdict(lambda: {"obs": {}, "impacts": set(), "reports": {}}), {}
     for f in sorted(glob.glob(str(LOGS / "feed-*.jsonl"))):
         for m in records(f, _feed):
             t = m["type"]
             if t == "storm_formed":
                 ident.append((m["received_at"], m["time"][:10], m["round"], m["storm"]))
+                continue
+            if t == "open":
+                opens.setdefault((m["time"][:10], m["round"]), m["received_at"])
                 continue
             k = (m["time"][:10], m["round"], m["storm"])
             if t == "storm":
@@ -188,27 +199,51 @@ def live_rounds(since="run-20261018-065413"):
         se = H.season_of(date)
         if se is None:
             continue
-        w0, w1 = t0, t1
+        # a round runs from its market open to the next round's market open (a season's first round from the
+        # season reset): trades made before a storm forms (the formation sleeve) belong to that storm's round
+        o0 = opens.get((date, rnd))
+        o0 = o0 if o0 is not None and 0 < t0 - o0 < 300 else None
+        w0, w1 = (o0 or t0), t1
         if rnd == 1:
             pos = collections.defaultdict(int)
-            w0 = min([x for x in resets if (forms[k - 1] if k else 0) < x <= t0], default=t0)
+            w0 = min([x for x in resets if (forms[k - 1] if k else 0) < x <= t0], default=(o0 or t0))
         if rnd == 3:
             w1 = min([x for x in resets if t0 < x < t1], default=t1)
+        else:
+            j1 = bisect.bisect_right(it, t1 + 3) - 1
+            o1 = opens.get((ident[j1][1], ident[j1][2])) if j1 >= 0 else None
+            if o1 is not None and t0 < o1 < t1:
+                w1 = o1
         start = dict(pos); cash = collections.defaultdict(float)
         pre_cash, pre_pos, exe = 0.0, collections.defaultdict(int), collections.defaultdict(float)
+        # formation-to-formation PnL (the bot's own ROUND RESULT window) for the ledger cross-check
+        ff_end = t1 if rnd != 3 else w1
+        ff_pos = collections.defaultdict(int, start); ff_cash = 0.0
+        sleeve_on = any(w0 <= x <= t0 for x in sleeve_marks)
+        sl_cash, sl_pos = collections.defaultdict(float), collections.defaultdict(int)
         for ts, s, q, px, syn in fills:
+            if w0 <= ts < t0:
+                ff_pos[s] += q
+            elif t0 <= ts < ff_end:
+                ff_cash -= q * px; ff_pos[s] += q
+            if sleeve_on and w0 <= ts < t0 + 30 and s in STORM_9:
+                sl_cash[s] -= q * px; sl_pos[s] += q
             if w0 <= ts < w1:
                 cash[s] -= q * px; pos[s] += q
                 if ts < t0:
                     pre_cash -= q * px; pre_pos[s] += q
                 if not syn:
                     exe[s] += q * (px - mid(s, ts - 2.5))            # paid vs mid just before the fill
-        endv = {s: se.settlement[s] if rnd == 3 else mid(s, t1) for s in SY}
+        start_t0 = {s: start.get(s, 0) + pre_pos.get(s, 0) for s in SY}
+        ff_pnl = ff_cash + sum(ff_pos[s] * (se.settlement[s] if rnd == 3 else mid(s, ff_end)) for s in SY) \
+            - sum(start_t0[s] * mid(s, t0) for s in SY)
+        sleeve_pnl = (sum(sl_cash.values()) + sum(q * mid(s, t0 + 30) for s, q in sl_pos.items())) if sleeve_on else 0.0
+        endv = {s: se.settlement[s] if rnd == 3 else mid(s, w1) for s in SY}
         leftover = {s: q for s, q in pos.items() if q} if rnd != 3 else {}
         end = {s: pos[s] * endv[s] for s in SY}
         if rnd == 3:
             pos = collections.defaultdict(int)
-        by_sym = {s: cash[s] + end[s] - start.get(s, 0) * mid(s, t0) for s in SY}
+        by_sym = {s: cash[s] + end[s] - start.get(s, 0) * mid(s, w0) for s in SY}
         pre = pre_cash + sum(q * mid(s, t0) for s, q in pre_pos.items())
         hits = collections.defaultdict(lambda: [0, 0])
         for ts, goals in decisions:
@@ -223,7 +258,7 @@ def live_rounds(since="run-20261018-065413"):
         out.append({"key": f"{se.number}-{rnd}", "season": se.number, "round": rnd, "storm": name, "date": date,
                     "started": time.strftime("%Y-%m-%d %H:%M", time.localtime(t0)), "pnl": sum(by_sym.values()),
                     "t_end": w1, "by_symbol": by_sym, "anomalies": {k_: v for k_, v in anom.items() if v},
-                    "diag": {"core_pnl": sum(by_sym.values()) - pre, "pre_storm_pnl": pre,
+                    "diag": {"core_pnl": ff_pnl, "pre_storm_pnl": pre, "sleeve_pnl": sleeve_pnl, "sleeve_on": sleeve_on,
                              "bot_ledger": bot_ledger(ledger, rnd, name, t0, t1, w1, restarts),
                              "exec_cost": dict(exe), "leftover": leftover, "carried_in": {s_: q for s_, q in start.items() if q}, "hits": {s: tuple(v) for s, v in hits.items()},
                              "move": {s: (mid(s, t0), endv[s]) for s in SY},
@@ -236,24 +271,42 @@ def live_rounds(since="run-20261018-065413"):
 _replay_cache = {}
 
 
-def honest_replay(season, epoch):
-    """Per-round, per-symbol PnL of the same research season with an honest model and the settings of `epoch`."""
-    key = (season, epoch[0])
+LIVE_MODEL = ROOT / "bot" / "models.pkl"
+
+
+_profile = {"t": 0.0, "p": None}
+
+
+def book_profile():
+    """The depth model from the recorded books (book_profile.build) reads every recorded book: ~35 s. Rebuilding it for
+    every replay stalled the monitor loop ~100 s at each new season (2 replays), and the live check then ran on stale
+    data: a false BOT SILENT at 2026-10-19 16:44. It changes slowly as books accumulate: rebuilt at most every 6 h."""
+    if _profile["p"] is None or time.time() - _profile["t"] > 6 * 3600:
+        from book_profile import build
+        _profile["p"], _profile["t"] = build(), time.time()
+    return _profile["p"]
+
+
+def honest_replay(season, epoch, live_model=False):
+    """Per-round, per-symbol PnL of the same research season with the settings of `epoch`, using an honest model
+    (never trained on this season: what the strategy does on an unseen storm) or, with live_model=True, the live
+    bot's own model (what the live bot would have done at house prices; it was trained on this season, so it is
+    optimistic, but it shares the live bot's decisions)."""
+    key = (season, epoch[0], live_model)
     if key in _replay_cache:
         return _replay_cache[key]
-    model = next((m for a, b, m in HONEST if a <= season <= b and m.exists()), None)
+    model = LIVE_MODEL if live_model else next((m for a, b, m in HONEST if a <= season <= b and m.exists()), None)
     if model is None:
         return None
     import strategy as S
     from replay import replay_season
-    from book_profile import build
     cfg = epoch[1]
     S.BUFFER, S.EDGE_SHARE = cfg["BUFFER"], cfg["EDGE_SHARE"]
     def tweak(st):
         st.allow_flip, st.min_age = cfg["allow_flip"], cfg["min_age"]
     extra = {"PORT": 0.002, "FERRY": 0.0012, "AQUA": 0.0021, "MAT": 0.0007, "GEN": 0.0005}   # live-calibrated costs
     rows = []
-    replay_season(season, model, 0.1, profile=build(), per_symbol=rows, extra=extra, tweak=tweak)
+    replay_season(season, model, 0.1, profile=book_profile(), per_symbol=rows, extra=extra, tweak=tweak)
     res = {}
     for r in rows:
         res.setdefault(r["round"], {})[r["symbol"]] = r["pnl"]
@@ -291,35 +344,39 @@ def _replay_paths(n, fills):
     return out
 
 
-def replay_at(rd, age):
-    """Honest replay round PnL of the same storm at this storm age (testnet seasons only), or None."""
+def replay_at(rd, age, live_model=False):
+    """Replay round PnL of the same storm at this storm age (testnet seasons only), or None."""
     date = rd["key"][0]
     se = H.season_of(date) if date else None
     if se is None:
         return None
     epoch = settings_at(time.strftime("%Y-%m-%d %H:%M", time.localtime(rd["t_form"])))
-    if honest_replay(se.number, epoch) is None:
+    if honest_replay(se.number, epoch, live_model) is None:
         return None
-    path = _path_cache[(se.number, epoch[0])].get(rd["round"])
+    path = _path_cache[(se.number, epoch[0], live_model)].get(rd["round"])
     if not path:
         return None
     return path[min(max(int(age // 5), 0), len(path) - 1)]
 
 
-def verdict(live_pnl, rep_pnl):
-    if rep_pnl is None:
+def verdict(live_pnl, rep_pnl, rep2_pnl=None):
+    """rep_pnl: honest replay; rep2_pnl: replay with the live bot's own model. Live-specific only if live is much
+    worse than both; variance if either lost too."""
+    reps = [x for x in (rep_pnl, rep2_pnl) if x is not None]
+    if not reps:
         return "NO REPLAY (new storm): judge by anomalies and symbols"
-    tol = max(2500.0, 0.5 * abs(rep_pnl))
-    if live_pnl - rep_pnl < -tol:
-        return "LIVE-SPECIFIC: live much worse than the honest replay of the same storm -- investigate"
-    if live_pnl < BAD and rep_pnl < BAD / 2:
-        return "VARIANCE: the honest replay of this storm lost too (the storm, not the bot)"
+    worst = min(reps)
+    tol = max(2500.0, 0.5 * abs(worst))
+    if live_pnl - worst < -tol:                      # much worse than BOTH replays
+        return "LIVE-SPECIFIC: live much worse than both replays of the same storm -- investigate"
+    if live_pnl < BAD and worst < BAD / 2:
+        return "VARIANCE: a replay of this storm lost too (the storm, not the bot)"
     if live_pnl < BAD:
         return "MIXED: bad round, replay lost less -- check the symbols with the largest gaps"
     return "OK"
 
 
-def diagnose(r, v, rep_total, sym_gap):
+def diagnose(r, v, rep_total, sym_gap, rep2_total=None):
     """Automatic analysis of a round: findings (list of lines) and a one-line cause."""
     d, lines, problems = r["diag"], [], []
     acct_bad = False
@@ -332,7 +389,11 @@ def diagnose(r, v, rep_total, sym_gap):
         lines.append(f"accounting: monitor ${d['core_pnl']:,.0f} vs bot's exchange ledger ${d['bot_ledger']:,.0f} "
                      f"({'MISMATCH' if acct_bad else 'agree'})" + (f"; pre-storm trades ${d['pre_storm_pnl']:,.0f}" if abs(d['pre_storm_pnl']) > 1 else ""))
     else:
-        lines.append("accounting: no bot ledger for this round (a restart split it); positions reconciled with the exchange")
+        lines.append("accounting: no bot ledger line for this round (a restart split it, or it was not logged yet); "
+                     "positions reconciled with the exchange")
+    if d.get("sleeve_on"):
+        lines.append(f"formation sleeve (positions built before the storm formed, closed by storm age 30): ${d['sleeve_pnl']:,.0f}; "
+                     f"the verdict compares live minus the sleeve with the replays")
     sh = d["storm"]
     if sh:
         rep = d["report"]
@@ -372,7 +433,8 @@ def diagnose(r, v, rep_total, sym_gap):
         cause = ("BOT/EXECUTION: " + "; ".join(problems)) if problems else \
                 "UNEXPLAINED: live much worse than the replay with no bot anomaly -- needs a manual look"
     elif v.startswith(("VARIANCE", "MIXED")):
-        cause = f"STORM (variance): the honest replay of the same storm made ${rep_total:,.0f}{turn}{hit}"
+        reps = ", ".join(f"{n} ${x:,.0f}" for n, x in (("honest replay", rep_total), ("same-model replay", rep2_total)) if x is not None)
+        cause = f"STORM (variance): replays of the same storm made {reps}{turn}{hit}"
         if problems:
             cause += " | also check: " + "; ".join(problems)
     elif v.startswith("NO REPLAY"):
@@ -380,6 +442,26 @@ def diagnose(r, v, rep_total, sym_gap):
     else:
         cause = "OK" + (" | check: " + "; ".join(problems) if problems else "")
     return lines, cause
+
+
+def sleeve_review(new):
+    """After each new round with the sleeve: alert when SLEEVE_MIN_N+ live sleeve rounds average below 0."""
+    if not any(rec.get("formation_sleeve_pnl") is not None for rec in new):
+        return None
+    sl = []
+    for line in open(LOGS / "round_reports.jsonl"):
+        try:
+            x = json.loads(line).get("formation_sleeve_pnl")
+        except ValueError:
+            continue
+        if x is not None:
+            sl.append(x)
+    if len(sl) >= SLEEVE_MIN_N and sum(sl) / len(sl) < 0:
+        msg = (f"FORMATION SLEEVE: {len(sl)} live rounds average ${sum(sl) / len(sl):,.0f}/round (backtest +$311): the agreed "
+               f"signal to switch it off ({{\"sleeve\": 0}} in bot/control.json) -- check bot/sleeve_report.py first")
+        alert(msg)
+        return msg
+    return None
 
 
 def report(rounds, seen, st):
@@ -391,21 +473,33 @@ def report(rounds, seen, st):
         rep = honest_replay(r["season"], epoch)
         rp = rep.get(r["round"]) if rep else None
         rep_total = sum(rp.values()) if rp else None
-        v = verdict(r["pnl"], rep_total)
-        sym_gap = {s: r["by_symbol"][s] - rp.get(s, 0.0) for s in SY} if rp else {}
-        flagged = r["pnl"] < BAD or not v.startswith(("OK", "NO REPLAY")) or bool(r["diag"]["leftover"])
-        lines, cause = diagnose(r, v, rep_total, sym_gap)
+        rep2 = honest_replay(r["season"], epoch, live_model=True) if rep is not None else None
+        rp2 = rep2.get(r["round"]) if rep2 else None
+        rep2_total = sum(rp2.values()) if rp2 else None
+        sleeve = r["diag"].get("sleeve_pnl", 0.0)
+        v = verdict(r["pnl"] - sleeve, rep_total, rep2_total)
+        sym_gap = {s: r["by_symbol"][s] - rp.get(s, 0.0) for s in SY} if rp else {}       # includes the sleeve if on
+        sleeve_bad = bool(r["diag"].get("sleeve_on")) and sleeve < SLEEVE_BAD
+        flagged = r["pnl"] < BAD or not v.startswith(("OK", "NO REPLAY")) or bool(r["diag"]["leftover"]) or sleeve_bad
+        lines, cause = diagnose(r, v, rep_total, sym_gap, rep2_total)
+        if sleeve_bad:
+            cause += (f" | FORMATION SLEEVE lost ${-sleeve:,.0f} this round (backtest worst -$392): check its fills "
+                      f"(bot/sleeve_report.py) and whether the house moved against its usual formation direction")
         if r["diag"]["bot_ledger"] is not None and cause.startswith("ACCOUNTING"):
             flagged = True
         worst = sorted(r["by_symbol"].items(), key=lambda kv: kv[1])[:3]
         rec = {"round": r["key"], "storm": r["storm"], "started": r["started"], "settings_since": epoch[0], "live_pnl": round(r["pnl"]),
-               "honest_replay_pnl": None if rep_total is None else round(rep_total), "verdict": v, "cause": cause,
+               "honest_replay_pnl": None if rep_total is None else round(rep_total),
+               "same_model_replay_pnl": None if rep2_total is None else round(rep2_total), "verdict": v, "cause": cause,
+               "formation_sleeve_pnl": round(sleeve) if r["diag"].get("sleeve_on") else None,
                "worst_symbols": {s: round(x) for s, x in worst}, "anomalies": r["anomalies"],
                "live_minus_replay": {s: round(g) for s, g in sym_gap.items()}, "diagnosis": lines,
                "bot_ledger": None if r["diag"]["bot_ledger"] is None else round(r["diag"]["bot_ledger"])}
         new.append(rec); seen.add(r["key"])
         line = (f"{r['started']}  season {r['season']} r{r['round']} {r['storm']:6s} live ${r['pnl']:8,.0f}  "
-                f"replay {'   n/a' if rep_total is None else f'${rep_total:8,.0f}'}  {v.split(':')[0]}")
+                f"replay {'   n/a' if rep_total is None else f'${rep_total:8,.0f}'}"
+                f"{'' if rep2_total is None else f' (same model ${rep2_total:,.0f})'}"
+                f"{f'  [formation sleeve ${sleeve:,.0f}]' if r['diag'].get('sleeve_on') else ''}  {v.split(':')[0]}")
         if flagged:
             msg = "ROUND " + line + f" | CAUSE: {cause}"
             if time.time() - r["t_end"] < 1800:
@@ -424,6 +518,7 @@ def report(rounds, seen, st):
         with open(LOGS / "round_reports.jsonl", "a") as f:
             for rec in new:
                 f.write(json.dumps(rec) + "\n")
+        sleeve_review(new)
         with open(LOGS / "round_reports.md", "a") as f:
             f.write("\n".join(md) + "\n")
         gaps = collections.defaultdict(list)
@@ -460,9 +555,10 @@ def main():
     if args.replay:
         start = time.mktime(time.strptime(time.strftime("%Y-%m-%d ") + args.replay, "%Y-%m-%d %H:%M"))
         out = []
-        D = Data(); D.replay_hook = replay_at; D.refresh()
+        D = Data(); D.replay_hook = replay_at; D.replay_hook2 = lambda rd, a: replay_at(rd, a, live_model=True); D.refresh()
+        end = time.time() - 10                       # the logs as loaded now (the run itself takes minutes)
         st, now = {}, start
-        while now <= time.time() - 10:
+        while now <= end:
             live_watch(D, st, now, lambda k, m, l: out.append((now, k, m, l)))
             now += 5.0
         for t, k, m, l in out:
@@ -475,15 +571,17 @@ def main():
     st = json.loads(state.read_text()) if state.exists() and not args.once else {}
     seen = set(st.get("seen", []))
     live = {"gap_step": st.get("gap_step", {})}
-    D = Data(); D.replay_hook = replay_at
+    D = Data(); D.replay_hook = replay_at; D.replay_hook2 = lambda rd, a: replay_at(rd, a, live_model=True)
     wst = {}
     last_sig, last_err = None, 0.0
     while True:
         try:
             D.refresh()
-            if len(D.forms) != last_sig:                           # a round may have completed
+            # a round completed when the next storm formed; wait 20 s so the bot has logged its own ROUND RESULT
+            if len(D.forms) != last_sig and (not D.forms or time.time() - D.forms[-1][0] > 20):
                 report(live_rounds(), seen, live); last_sig = len(D.forms)
             if not args.once:
+                D.refresh()                                   # a round report can take a while: never judge on stale data
                 live_watch(D, wst, time.time(), emit_alert)
                 state.write_text(json.dumps({"seen": sorted(seen), "gap_step": live["gap_step"]}))
         except Exception as exc:

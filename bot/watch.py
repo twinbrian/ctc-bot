@@ -70,12 +70,16 @@ def _book(b):
     return None
 
 
-FEED_KEEP = ("storm_formed", "storm", "impact", "damage_report", "advisory", "storm_dissipated")
+FEED_KEEP = ("storm_formed", "storm", "impact", "damage_report", "advisory", "storm_dissipated", "snapshot")
 
 
 def _feed(fr):
     m = fr.get("message") or {}
     if m.get("type") not in FEED_KEEP:
+        return None
+    if m["type"] == "snapshot":                     # keep only the market open of each round (pre-storm, market 09:30)
+        if m.get("phase") == "pre_storm" and str(m.get("time", "")).endswith("09:30:00"):
+            return {"received_at": fr["received_at"], "type": "open", "time": m["time"], "round": m.get("round")}
         return None
     keep = ("type", "time", "round", "storm", "age", "x", "y", "vx", "vy", "radius", "intensity", "island", "stage",
             "damage_pct", "industry_loss_musd", "source", "outlook", "headline")
@@ -148,12 +152,14 @@ class Data:
         self.restarts = []
         self.book_t, self.book_m = collections.defaultdict(list), collections.defaultdict(list)
         self.ident = []                     # (t, date, round, storm) from the feed
+        self.opens = []                     # (t, date, round): market open of each round
         self.obs = collections.defaultdict(list)       # (date, round, storm) -> [(t, age, x, y, vx, vy, radius, I)]
         self.adv = collections.defaultdict(list)       # key -> [(t, age, source, outlook, headline)]
         self.impacts = collections.defaultdict(list)   # key -> [(t, island)]
         self.reports = collections.defaultdict(list)   # key -> [(t, stage, damage_pct, loss)]
         self.dissipated = {}                           # key -> t
         self.replay_hook = None                        # fn(round info, storm age) -> honest replay round PnL, or None
+        self.replay_hook2 = None                       # same, replaying with the live bot's own model
         self._done, self._snap = {}, {}
 
     def refresh(self):
@@ -206,6 +212,8 @@ class Data:
                 t, typ = m["received_at"], m["type"]
                 if typ == "storm_formed":
                     self.ident.append((t, m["time"][:10], m["round"], m["storm"])); continue
+                if typ == "open":
+                    self.opens.append((t, m["time"][:10], m["round"])); continue
                 k = (m["time"][:10], m["round"], m["storm"])
                 if typ == "storm":
                     self.obs[k].append((t, m["age"], m["x"], m["y"], m["vx"], m["vy"], m["radius"], m["intensity"]))
@@ -348,11 +356,16 @@ def diagnose_live(D, t, known, rd, t_ref):
     ctx = collections.Counter(e for ts, e, _ in D.events if rd["t_form"] <= ts <= t and e in HEALTH)
     ctx_rs = sum(rd["t_form"] < x <= t for x in D.restarts)
     # the honest replay of the same storm over the same storm ages (testnet: the seasons are research seasons)
-    rep_d = None
+    rep_d = rep2_d = None
     if D.replay_hook is not None:
         r1, r0 = D.replay_hook(rd, t - rd["t_form"]), D.replay_hook(rd, max(t_ref - rd["t_form"], 0.0))
         if r1 is not None and r0 is not None:
             rep_d = r1 - r0
+    if D.replay_hook2 is not None:
+        r1, r0 = D.replay_hook2(rd, t - rd["t_form"]), D.replay_hook2(rd, max(t_ref - rd["t_form"], 0.0))
+        if r1 is not None and r0 is not None:
+            rep2_d = r1 - r0
+    reps = [x for x in (rep_d, rep2_d) if x is not None]
     lines = []
     worst = sorted(by.items(), key=lambda kv: kv[1]["total"])
     n_against = sum(1 for x in by.values() if x["total"] < -50)
@@ -369,8 +382,10 @@ def diagnose_live(D, t, known, rd, t_ref):
             f"{s} {first[3].get(s, 0):+.2f}->{dec[-1][3].get(s, 0):+.2f}" for s, x in worst[:4] if s in dec[-1][3]))
     st_lines, surprise = _storm_lines(D, rd, t_ref, t)
     lines += st_lines
-    if rep_d is not None:
-        lines.append(f"honest replay of this same storm over the same ages {age0:.0f}-{age1:.0f}: ${rep_d:,.0f} (live ${loss:,.0f})")
+    if reps:
+        lines.append(f"replays of this same storm over the same ages {age0:.0f}-{age1:.0f}: "
+                     + ", ".join(f"{n} ${x:,.0f}" for n, x in (("honest model", rep_d), ("live bot's own model", rep2_d)) if x is not None)
+                     + f" (live ${loss:,.0f})")
     if ctx_rs:
         ctx["restart"] = ctx_rs
     lines.append("bot health this round: " + (", ".join(f"{h} {n}" for h, n in ctx.items()) if ctx else "no errors, rejects, disconnects or restarts")
@@ -379,23 +394,34 @@ def diagnose_live(D, t, known, rd, t_ref):
         lines.append(f"CHECK {s}: {why} (${by[s]['total']:,.0f} in the window)")
     if loss >= 0:
         return "no loss in the window", lines
+    # a brief websocket disconnect cannot hurt positions that are only being held: blame it only if a decision was
+    # missed or late (they come every 20 s) or no replay of the storm explains the loss. 2026-10-19 Ivo r3 (17:02):
+    # a 2 s disconnect at age 175, decisions on schedule, both replays lost $7,648 of live $8,034 -> it was the storm.
+    dts = [d[0] for d in dec if w0 <= d[0] <= t]
+    dec_gap = max((b_ - a_ for a_, b_ in zip(dts, dts[1:])), default=0.0)
+    harmless_disc = (set(serious) == {"DISCONNECTED"} and dec_gap <= 25.0 and bool(reps) and min(reps) <= 0.5 * loss)
+    disc_note = ""
+    if harmless_disc:
+        disc_note = "; a brief disconnect near the drop did not cause it (decisions on schedule, the replays lost as much)"
+        serious = {}
     if serious:
         cause = f"BOT: {', '.join(serious)} near the drop -- check whether it caused the loss"
     elif flagged and flagged_pnl <= 0.25 * loss:
         cause = f"BOT: {', '.join(flagged)} held against the bot's own plan lost ${-flagged_pnl:,.0f} of the ${-loss:,.0f}"
     elif execution <= 0.4 * loss and cost_bp > 2 * TYPICAL_COST_BP:
         cause = f"EXECUTION: trading costs ${-execution:,.0f} of the ${-loss:,.0f} ({cost_bp:.0f} bp, typical {TYPICAL_COST_BP:.0f})"
-    elif rep_d is not None and rep_d <= 0.5 * loss:
-        # no bot problem and normal costs: the honest replay of the same storm, over the same ages, is the arbiter
+    elif reps and min(reps) <= 0.5 * loss:
+        # no bot problem and normal costs: a replay of the same storm (honest model or the live bot's own model),
+        # over the same ages, losing at least half as much is the arbiter
         storm = f"; the storm is {surprise:.1f} radii off where its motion pointed 60 s ago" if surprise is not None and surprise >= 1.0 else ""
-        cause = (f"STORM (variance): the honest replay of this storm lost ${-rep_d:,.0f} over the same ages (live ${-loss:,.0f}); "
+        cause = (f"STORM (variance): a replay of this storm lost ${-min(reps):,.0f} over the same ages (live ${-loss:,.0f}); "
                  f"{market / loss:.0%} of the loss is price moves on the model's positions ({n_against} symbols), "
-                 f"execution {cost_bp:.0f} bp (typical {TYPICAL_COST_BP:.0f}){storm}; no bot problem found")
+                 f"execution {cost_bp:.0f} bp (typical {TYPICAL_COST_BP:.0f}){storm}; no bot problem found{disc_note}")
     elif market <= 0.5 * loss:
         what = f"{market / loss:.0%} of the loss is price moves on the positions the model chose ({n_against} symbols moved against it together)"
-        if rep_d is not None:
-            cause = (f"MARKET, BUT NOT IN THE REPLAY: {what}; the honest replay over the same ages: ${rep_d:,.0f} -- "
-                     f"live positions or timing differ from the strategy's; check")
+        if reps:
+            cause = (f"MARKET, BUT NOT IN THE REPLAYS: {what}; replays over the same ages: "
+                     + ", ".join(f"${x:,.0f}" for x in reps) + " -- live prices, positions or timing differ; check")
         else:
             cause = f"MARKET/STORM: {what}; no bot problem found (no replay for this storm)"
     else:
