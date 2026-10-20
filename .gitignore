@@ -2,7 +2,7 @@
 analysis/cache.pkl
 analysis/storm_tensors.npz
 # written by the running bot
-bot/logs/
+bot/logs*/
 bot/state.json
 bot/control.json
 __pycache__/

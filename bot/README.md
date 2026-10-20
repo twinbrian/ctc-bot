@@ -7,6 +7,10 @@ Trades the edges in `analysis/FINDINGS.md` on the Cornell Trading Competition ex
   move by the end of the storm. If 70% of that move clears 1% of the price, the bot works toward the full
   position limit in that direction, paying at most mid + 70% of the predicted move − 1% of price per share.
   In rounds 1–2 it flattens when the storm dissipates; in round 3 it holds to settlement.
+- **Formation sleeve (since 2026-10-19).** 30–58 s after each market open, before the storm forms, it builds
+  20% of the limit in the direction the house reliably reprices at formation (island stocks and HAVEN up,
+  rebuilders down), then closes it at storm ages 10–28 s, before the in-storm model starts. Every order stays
+  within 0.5% of mid.
 - **Round-3 final report.** The final damage report fixes every settlement exactly. The bot takes
   every resting order on the wrong side of value ± a safety margin, then holds to settlement.
 
@@ -19,6 +23,7 @@ the storms still to come.
 
 | | Rounds 1–2 | Round 3 |
 |---|---|---|
+| Before the storm (30–58 s after the open) | Formation sleeve: 20% of the limit toward the formation repricing, closed at storm ages 10–28 | same |
 | During the storm (ages 30–470 s) | Full position limit toward the predicted house move, paying ≤ 70% of it − 1% of price; no flips | same |
 | Storm ends | Close at the model's fair value (± half-spread + 0.15%); never chase a runaway book | **Hold**: no later storm to carry risk into |
 | Damage reports | Re-close leftovers within 0.3% of mid, retried from the current mid every 20 s until flat | Final report: exact settlement values; take mispriced quotes, hold everything to settlement |
@@ -73,6 +78,36 @@ season 79 that cost $7.3k in one round. Waiting for the first official advisory:
 The front-run loses money and is **off**. The jump is real, but crossing the thin storm-time book
 twice costs more than the jump pays. REIN is not traded in-storm, because its edge is below its cost.
 
+### Formation sleeve (added 2026-10-19, from Ryan's research)
+
+The front-run buys *after* the storm forms, into a book that is already repricing. The sleeve buys *before*, while
+the pre-storm book is calm, and only 20% of the limit, so it fills within 0.5% of mid.
+
+- **Directions:** mean formation move per symbol and round, from research seasons 161–600. The testnet has never
+  replayed those seasons, so the test below is out-of-sample (`bot/formation_dirs.json`).
+- **Timing:** the open is timed from the first pre-storm snapshot whose market clock is running. In round 1 of
+  every testnet season the clock sits at 09:30:00 for about 120 s before it starts.
+- **Test:** the bot's own code, run on the recorded live testnet feed and books (94 rounds, 55 orders/min). With
+  the sleeve off, this backtest reproduces the bot's real live results ($2,800 vs $2,770 per round).
+
+| Result (per round, vs the same bot without the sleeve) | |
+|---|---|
+| Total round PnL | **+$302** (se $46), better in 78% of rounds; positive in rounds 1, 2 and 3 and in both halves of the period |
+| The sleeve's own trades | +$311, positive in 82%, worst −$392; 100% filled before formation, 3% left for the model |
+| After an allowance for our own price impact (~0.7% of price per full limit, measured on our live fills) | ≈ +$258 (≈ +$770/season) |
+
+Tested and **not** used:
+
+| Idea | Result per round | Why not |
+|---|---|---|
+| Sleeve at full size | +$1,297, ≈ +$305 after impact | Worst rounds −$4.7k; impact grows with size |
+| Price band on the model's in-storm orders (1% of mid) | +$100 (se $77) | Saves $630 of costs but misses $530 of moves: the expensive fills are the ones made while prices move fast |
+| ETF create/redeem as a route for the sleeve | about equal on entry, worse on exit | ARCH lags its components just after formation |
+
+Live check: each round report shows the sleeve's own PnL, and `bot/sleeve_report.py` compares the live rounds with
+the backtest. Stop rule, agreed before it went live: switch it off (`{"sleeve": 0}`) if 15+ live rounds average
+below 0. The monitor alerts on that, and on any single sleeve round below −$1,000.
+
 ## Run it
 
 ```bash
@@ -105,6 +140,7 @@ Write one JSON command to `bot/control.json`. The bot reads it within 2 s and de
 | `{"flatten": true}` | Close every position within 1% of mid, retrying from the current mid every 20 s until flat, then stay halted. Any entry still being worked is stopped. |
 | `{"close": ["ARCH"]}` | Close these positions within 1% of mid. |
 | `{"pause": ["GEN"]}` / `{"resume": ["GEN"]}` | Stop or restart trading these symbols. Announcements pause their symbols automatically. |
+| `{"sleeve": 0}` / `{"sleeve": 0.2}` | Formation sleeve off / back on (fraction of each limit). Off stops new entries at once; a sleeve position already built is still closed by its exit after formation, or treated like any leftover before formation. Paused symbols are never traded by the sleeve. |
 
 The brake and pauses are not saved: **a restart releases them.** Nothing in the bot turns the brake on by itself;
 only these commands do. The change was checked on 10 replayed seasons with fixed inputs, where results were
@@ -176,6 +212,11 @@ running live-minus-replay gap per symbol (an ALERT for each further −$2.5k).
 
 When you change the bot's settings, add a line to `SETTINGS` in `monitor.py`. The monitor only
 reports; it never changes the bot.
+
+**Formation sleeve.** Round reports show the sleeve's own PnL (its fills from entry to storm age 30), and the
+verdict compares live *minus* the sleeve with the replays, which don't run it. ALERTs: a sleeve round below
+−$1,000 (backtest worst −$392), and 15+ live sleeve rounds averaging below 0 (the agreed stop signal).
+Per-round detail: `OMP_NUM_THREADS=1 /opt/anaconda3/bin/python3 -I bot/sleeve_report.py`.
 
 **Monitor accounting bug (fixed 2026-10-18 16:30):** the monitor charged every fill to the window between
 two storm formations. Trades in the gap between a season reset and the new season's first storm were charged
@@ -308,7 +349,7 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 | File | Contents |
 |---|---|
 | `live.py` | Websocket runner (`--smoke-test`, `--dry-run`, live) |
-| `strategy.py` | When to trade; goals = (target, price cap, priority) |
+| `strategy.py` | When to trade; goals = (target, price cap, priority[, band: no order further than band x mid from mid]) |
 | `broker.py` | Works goals against the book: a limit order at the cap for the depth available within it, cancel after 2 s, retry every 3 s, positions polled every 1 s, one rate budget per key, PnL ledger |
 | `engine.py` | Live features, identical to the research features (`replay.py --parity`) |
 | `train.py` | `models.pkl` (all 600 seasons) and `models_holdout100.pkl` (seasons 1–500, for honest replays) |
@@ -316,7 +357,9 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 | `book_profile.py` | Depth model from recorded books (it grows as more books are recorded, so replay results drift slightly over time) |
 | `monitor.py` | Round reports, live alerts and their diagnosis (see "Round monitor") |
 | `watch.py` | The monitor's live PnL engine, alert rules and diagnosis |
-| `test_fake_exchange.py` | End-to-end checks of strategy + broker against an in-memory exchange (19 checks) |
+| `test_fake_exchange.py` | End-to-end checks of strategy + broker against an in-memory exchange (29 checks) |
+| `formation_dirs.json` | The formation sleeve's directions: mean formation move per round and symbol, research seasons 161–600 |
+| `sleeve_report.py` | Live formation-sleeve rounds vs the backtest, and the stop rule |
 | `port_variants.py`, `cost_variants.py`, `compare_variants.py` | Held-out tests of strategy variants |
 
 ## Not in v1
@@ -413,6 +456,11 @@ make it safe:
   key, and set it as `HURRICANE_BOT_KEY`. Optionally add `HURRICANE_EXTRA_KEYS` for more order throughput.
 - **Endpoint.** Confirm the competition endpoint (the testnet ran on `cornelltradingcompetition.org`).
 - **Announcements.** Decide the announcement policy (above).
+- **Clean log folder.** With the bot and monitor stopped, move the testnet logs out:
+  `mv bot/logs bot/logs_testnet`. At startup the bot replays every `bot/logs/feed-*.jsonl` to rebuild its season
+  state, so the competition season must not start on top of the testnet seasons. Keep `bot/logs_testnet` (git-ignored
+  like `bot/logs`, see `.gitignore`): it is the recorded live market data every backtest runs on, and it cannot be
+  downloaded again.
 - **Machine.** Run on a machine that stays awake, plugged in and online, or on a server. Start the bot
   before round 1 under `caffeinate -is`, and start the monitor.
 - **Expectations.** Expect the held-out figures, not the testnet's (see "Realistic expectation").
