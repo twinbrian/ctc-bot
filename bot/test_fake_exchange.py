@@ -210,6 +210,71 @@ def main():
     check("9e flatten: retried from the current mid until flat, still halted", fx.pos == 0 and st.halted and not st.flattening,
           f"pos {fx.pos}, trades {[(t['side'], t['quantity'], t['price']) for t in fx.trades]}")
 
+    # 10. per-order band (the formation sleeve's orders): whatever the cap, no order further than band x mid from mid
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    b.set_targets({SYM: (300, 41.0, 1.0, 0.002)}, reason="band test", urgent=True); wait(1.5, refresh)
+    prices = sorted({t["price"] for t in fx.trades})
+    check("10a band 0.2%: only levels within 0.2% of mid (40.05, 40.08) fill", fx.trades and max(prices) <= 40.08, f"prices {prices}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    b.set_targets({SYM: (300, 41.0, 1.0)}, reason="no band", urgent=True); wait(1.0, refresh)
+    prices = sorted({t["price"] for t in fx.trades})
+    check("10b without a band the deep levels fill (as today)", max(prices) >= 40.15, f"prices {prices}")
+
+    # 11. formation sleeve: enters after market open within 0.5% of mid, holds through formation, exits at ages 10-28
+    FE = S.FORM_ENTRY; S.FORM_ENTRY = (20.0, 58.0)
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.form_frac = 0.2
+    st.on_news({"type": "snapshot", "phase": "pre_storm", "round": 1, "storm": "X", "time": "2025-08-04T09:40:00", "damage": []})
+    wait(2.5, lambda: (refresh(), st.tick()))
+    tgt = int(LIMITS[SYM] * 0.2) * (1 if st.form_dirs["1"][SYM]["move"] > 0 else -1)
+    check("11a sleeve entered the target before the storm", fx.pos == tgt and all(abs(t["price"] / 40 - 1) <= 0.005 for t in fx.trades),
+          f"pos {fx.pos}, target {tgt}, prices {sorted({t['price'] for t in fx.trades})}")
+    obs = lambda a, q: {"type": "storm", "round": 1, "storm": "X", "time": "2025-08-04T10:00:00", "age": a, "x": 480.0, "y": 740.0 - 2 * a,
+                        "vx": 0.0, "vy": -1.8, "radius": 80.0, "intensity": 1.0, "seq": q}
+    st.on_news({"type": "storm_formed", "round": 1, "storm": "X", "time": "2025-08-04T10:00:00", "seq": 1, "headline": "formed"})
+    st.on_news(obs(0, 2)); wait(1.0, lambda: (refresh(), st.tick()))
+    check("11b sleeve holds through formation", fx.pos == tgt and st.sleeve["state"] == "hold", f"pos {fx.pos}, state {st.sleeve['state']}")
+    st.on_news(obs(12, 3)); wait(2.5, lambda: (refresh(), st.tick()))
+    check("11c sleeve exits at storm age 10-28 within 0.5% of mid", fx.pos == 0 and all(abs(t["price"] / 40 - 1) <= 0.005 for t in fx.trades),
+          f"pos {fx.pos}, trades {[(t['side'], t['quantity'], t['price']) for t in fx.trades]}")
+    st.on_news(obs(30, 4)); wait(0.5, lambda: (refresh(), st.tick()))
+    check("11d sleeve done at age 28+", st.sleeve["state"] == "done", st.sleeve["state"])
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.on_news({"type": "snapshot", "phase": "pre_storm", "round": 1, "storm": "X", "time": "2025-08-04T09:40:00", "damage": []})
+    wait(1.5, lambda: (refresh(), st.tick()))
+    check("12 sleeve off (the Strategy default; live.py sets it on): no sleeve, no orders", st.sleeve is None and fx.pos == 0 and not fx.trades)
+    # round 1 of a testnet season: the clock sits at 09:30:00 for ~120 s, so a 09:30 snapshot must not start the timer
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.form_frac = 0.2; S.FORM_ENTRY = FE
+    st.on_news({"type": "snapshot", "phase": "pre_storm", "round": 1, "storm": "X", "time": "2025-08-04T09:30:00", "damage": []})
+    wait(1.5, lambda: (refresh(), st.tick()))
+    check("11e a 09:30:00 snapshot (clock maybe paused) does not time the open", st.sleeve is None and fx.pos == 0 and not fx.trades,
+          f"sleeve {st.sleeve}, pos {fx.pos}")
+    st.on_news({"type": "snapshot", "phase": "pre_storm", "round": 1, "storm": "X", "time": "2025-08-04T09:44:30", "damage": []})
+    wait(3.5, lambda: (refresh(), st.tick()))
+    check(f"11f the first running-clock snapshot times the open (29 s) and the sleeve enters from {FE[0]:.0f} s",
+          st.round_open is not None and st.sleeve["state"] == "entry" and fx.pos == tgt, f"sleeve {st.sleeve}, pos {fx.pos}")
+    # an announcement on a symbol the sleeve holds: the sleeve hands it over (paused; only the follower may trade it)
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.form_frac = 0.2
+    st.on_news({"type": "snapshot", "phase": "pre_storm", "round": 1, "storm": "X", "time": "2025-08-04T09:45:00", "damage": []})
+    wait(2.5, lambda: (refresh(), st.tick()))
+    held = fx.pos
+    st.on_news({"type": "announcement", "symbols": [SYM], "headline": "test announcement", "time": "2025-08-04T09:50:00"})
+    st.on_news({"type": "storm_formed", "round": 1, "storm": "X", "time": "2025-08-04T10:00:00", "seq": 1, "headline": "formed"})
+    st.on_news(obs(0, 2)); st.on_news(obs(12, 3)); wait(3.5, lambda: (refresh(), st.tick()))
+    check("11g announcement: the sleeve drops the symbol and does not trade it any more (paused, follower's call)",
+          held == tgt and fx.pos == held and SYM not in st.sleeve["targets"] and SYM in st.paused, f"held {held}, pos {fx.pos}")
+    # a manual pause ({"pause": [...]} in control.json) is respected by the sleeve's exit too
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.form_frac = 0.2
+    st.on_news({"type": "snapshot", "phase": "pre_storm", "round": 1, "storm": "X", "time": "2025-08-04T09:45:00", "damage": []})
+    wait(2.5, lambda: (refresh(), st.tick()))
+    held = fx.pos; st.paused.add(SYM)
+    st.on_news({"type": "storm_formed", "round": 1, "storm": "X", "time": "2025-08-04T10:00:00", "seq": 1, "headline": "formed"})
+    st.on_news(obs(0, 2)); st.on_news(obs(12, 3)); wait(3.5, lambda: (refresh(), st.tick()))
+    check("11h manual pause: the sleeve's exit leaves the paused symbol alone", held == tgt and fx.pos == held, f"held {held}, pos {fx.pos}")
+
     print("\nALL PASSED" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1
 

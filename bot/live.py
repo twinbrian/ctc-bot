@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "bot"))
 import websockets
 
 from broker import LiveBroker, Rest, SimBroker
-from strategy import Strategy
+from strategy import FORM_SIZE, Strategy
 
 DEFAULT_URL = "https://cornelltradingcompetition.org"
 
@@ -114,6 +114,9 @@ async def run(args):
                                                     "cancel remainder", "decision", "positions error", "error"})
     feed_file = (logs / f"feed-{stamp}.jsonl").open("a")
     strat = Strategy(ROOT / "bot" / "models.pkl", limits, None, log, clock=time.monotonic)
+    strat.form_frac = FORM_SIZE                             # formation sleeve (strategy.py); off: control.json {"sleeve": 0}
+    log("formation sleeve", size=strat.form_frac)
+    print(f"formation sleeve: {strat.form_frac:.0%} of limits")
     keys = [k for k in [key] + os.environ.get("HURRICANE_EXTRA_KEYS", "").split(",") if k]
     strat.broker = (SimBroker(strat.quotes, log, limits, clock=time.monotonic, books=strat.books) if args.dry_run
                     else LiveBroker([Rest(args.url, k) for k in keys], strat.quotes, strat.books, log, limits))
@@ -177,7 +180,10 @@ async def run(args):
            {"close": ["ARCH"]}            close these positions within 1% of mid
            {"flatten": true}              close every position within 1% of mid (retried from the current mid every 20 s
                                           until flat), then stay halted
-           {"sniper": false} / {"follow": false} / {"stubs": true}   switch the extra strategies"""
+           {"sniper": false} / {"follow": false} / {"stubs": true}   switch the extra strategies
+           {"sleeve": 0} / {"sleeve": 0.2}  formation sleeve size (fraction of limits). 0 = no new sleeve entries from
+                                          now on; a sleeve position already held is still closed by its exit if the
+                                          storm has formed, otherwise it is treated like any leftover position"""
         while True:
             await asyncio.sleep(2)
             try:
@@ -191,6 +197,12 @@ async def run(args):
                 strat.halted, strat.flattening = bool(cmd["halt"]), False
                 if strat.halted:
                     strat.broker.set_targets({x: (strat.broker.position(x), None, 0.0) for x in strat.quotes}, reason="manual halt")
+            if "sleeve" in cmd:
+                strat.form_frac = max(0.0, min(1.0, float(cmd["sleeve"])))
+                if strat.form_frac == 0.0 and strat.sleeve and strat.sleeve["state"] in ("wait", "entry"):
+                    strat.sleeve["state"] = "done"              # stop entering now; held sleeve positions go to the model
+                    strat.broker.set_targets({x: (strat.broker.position(x), None, 0.0) for x in strat.sleeve["targets"]},
+                                             reason="formation sleeve stopped")
             for flag, attr in (("sniper", "sniper_on"), ("follow", "follow_on"), ("stubs", "stubs_on")):
                 if flag in cmd:
                     setattr(strat, attr, bool(cmd[flag]))

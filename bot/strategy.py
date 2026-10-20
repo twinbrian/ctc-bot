@@ -38,6 +38,21 @@ OUTAGE_FREE = {"ISLE", "AQUA", "HAVEN", "REIN", "RECON", "MAT"}   # values need 
 FORM_DIR = {"ISLE": 1, "AQUA": 1, "GRID": 1, "FERRY": 1, "HAVEN": 1, "RECON": -1, "MAT": -1, "GEN": -1}
 FORM_CAP = 0.004
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
+# --- formation sleeve (live since 2026-10-19) -------------------------------------------------------------------
+# The house reprices island stocks/HAVEN up and rebuilders down within seconds of storm_formed (77% of the move by
+# storm age 4, peak by age 28; research seasons 161-600). Build FORM_SIZE x the limit before the storm forms (30-58 s
+# after market open), hold through formation, exit at storm ages 10-28, every order within FORM_BAND of the current
+# mid; any leftover is handed to the in-storm model at age 30. Directions: bot/formation_dirs.json (seasons 161-600,
+# never replayed on the testnet). The open is timed from the first pre-storm snapshot whose market clock is running
+# (~30 s in): in round 1 of a testnet season the clock sits at 09:30:00 for ~120 s, so a 09:30 snapshot is no open.
+# Backtest (this code on the recorded live books, 94 rounds, 55 orders/min): +$302/round vs without (se 46), better
+# in 78% of rounds; the sleeve's own trades +$311/round, worst -$392; ~+$258/round after our own price impact.
+# Full size was +$305/round after impact with -$4.7k rounds -> 20%. Off: bot/control.json {"sleeve": 0}.
+FORM_SIZE = 0.2                            # fraction of each limit (set by live.py; the Strategy default is off)
+FORM_BAND = 0.005
+FORM_ENTRY = (30.0, 58.0)                  # seconds after market open (formation is at 60)
+FORM_EXIT = (10.0, 28.0)                   # storm age
+FORM_DIRS_FILE = Path(__file__).resolve().parent / "formation_dirs.json"
 BASKET_OF = {"ARCH": ("PORT", "ISLE", "AQUA", "GRID", "FERRY", "HAVEN"), "REBLD": ("RECON", "MAT", "GEN")}
 # implausible-prediction bound: 1.5x the largest out-of-sample prediction seen in research (% of price)
 PRED_MAX = {"PORT": 0.35, "ISLE": 0.20, "AQUA": 0.24, "GRID": 0.15, "FERRY": 0.31, "RECON": 0.16, "MAT": 0.105,
@@ -69,6 +84,13 @@ class Strategy:
         self.paused: set = set()                            # symbols not traded (announcement or manual)
         self.halted = False                                 # manual brake (bot/control.json): no automatic trading at all
         self.flattening = False                             # manual {"flatten": true}: close everything, then stay halted
+        self.form_frac = 0.0                                # formation sleeve size, fraction of the limits (0 = off)
+        self.round_open = None                              # (clock at market open, round, (date, round))
+        self.sleeve = None                                  # formation sleeve state for the current round
+        try:
+            self.form_dirs = json.loads(FORM_DIRS_FILE.read_text())["rounds"]
+        except (OSError, ValueError, KeyError):
+            self.form_dirs = {}
         # sniper OFF: replaying every recorded live book through it (bot/test_sniper_replay.py) lost money --
         # its fair-value estimate (house quote ladder) can be wrong and stuck, so 'mispriced' orders were mostly not.
         self.sniper_on, self.follow_on, self.stubs_on = False, True, False
@@ -186,12 +208,16 @@ class Strategy:
                 if m["round"] == 3:
                     self.final_snipe()
         elif typ == "snapshot":
+            self._note_open(m)
             self.on_snapshot(m)
         elif typ == "announcement":
             # the company's economics changed: the valuation formulas may now be wrong for these symbols.
             # Stop trading them (positions are held) until a human resumes them via bot/control.json.
             syms = [x for x in (m.get("symbols") or []) if x in self.limits] or list(self.limits)
             self.paused |= set(syms)
+            if self.sleeve:                                  # the sleeve stops working them: they are paused/followed now
+                for x in syms:
+                    self.sleeve["targets"].pop(x, None)
             for x in ("ARCH", "REBLD"):                      # ETFs contain the paused stocks
                 if any(y in BASKET_OF.get(x, ()) for y in syms):
                     self.paused.add(x)
@@ -275,6 +301,82 @@ class Strategy:
         self.broker.set_targets({s: (tgt, cap, 1e9)}, reason="unwind stub fill", urgent=True)
         self.log("STUB FILLED", symbol=s, side=side, qty=qty, price=price, house_mid=round(hm, 3))
 
+    def _sleeve_syms(self):
+        """Symbols the formation sleeve is still working (excluded from the leftover/after-storm exits). A paused
+        symbol (announcement or manual pause) is never traded by the sleeve."""
+        sl = self.sleeve
+        return {s for s in sl["targets"] if s not in self.paused} if sl and sl["state"] in ("entry", "hold", "exit") else set()
+
+    def _note_open(self, m):
+        """Time the round's open from the first pre-storm snapshot whose market clock is running (past 09:30:00;
+        real seconds = market seconds / 30). A 09:30:00 snapshot is skipped: the clock may be paused there."""
+        if self.replaying or m.get("phase") != "pre_storm":
+            return
+        t = str(m.get("time", ""))
+        try:
+            el = ((int(t[11:13]) - 9) * 3600 + (int(t[14:16]) - 30) * 60 + int(t[17:19])) / 30.0
+        except ValueError:
+            return
+        key = (t[:10], m.get("round"))
+        if not 0 < el < 60 or (self.round_open and self.round_open[2] == key):
+            return
+        self.round_open = (self.clock() - el, m.get("round"), key)
+        self.sleeve = {"state": "wait", "round": m.get("round"), "last": -1e9, "targets": {}} if self.form_frac > 0 else None
+        self.log("market open", round=m.get("round"), seconds_since_open=round(el, 1), sleeve=self.form_frac)
+
+    def _sleeve_tick(self, now):
+        sl = self.sleeve
+        if not sl or self.round_open is None or self.season.approximate or self.replaying:
+            return
+        t_open, rnd, _ = self.round_open
+        el = now - t_open
+        dirs = self.form_dirs.get(str(rnd), {})
+        st = self.storm
+        formed = st is not None and st.round == rnd and bool(st.obs) and not st.joined_late
+        age = max(st.obs) if formed else None
+        if sl["state"] == "wait":
+            if formed or el > FORM_ENTRY[1]:
+                sl["state"] = "done"; return                    # opened too late to enter before the storm
+            if el >= FORM_ENTRY[0]:
+                sl["state"] = "entry"
+                sl["targets"] = {s: (1 if d["move"] > 0 else -1) * int(self.limits[s] * self.form_frac)
+                                 for s, d in dirs.items() if s in self.limits and s not in self.paused
+                                 and abs(d["move"]) / d["price"] >= 2 * FORM_BAND and int(self.limits[s] * self.form_frac)}
+                self.log("FORMATION SLEEVE entry", round=rnd, targets=sl["targets"])
+        if sl["state"] == "entry":
+            if formed or el > FORM_ENTRY[1]:
+                sl["state"] = "hold"
+                self.broker.set_targets({s: (self.broker.position(s), None, 0.0) for s in self._sleeve_syms()}, reason="formation sleeve hold")
+                self.log("FORMATION SLEEVE holding through formation", positions={s: self.broker.position(s) for s in sl["targets"]})
+            elif now - sl["last"] >= 4.0:
+                sl["last"] = now
+                goals = {}
+                for s, tgt in sl["targets"].items():
+                    if s in self.quotes and s not in self.paused:
+                        mid = sum(self.quotes[s]) / 2; d = 1 if tgt > 0 else -1
+                        goals[s] = (tgt, mid * (1 + d * FORM_BAND), abs(dirs[s]["move"]) * abs(tgt), FORM_BAND)
+                if goals:
+                    self.broker.set_targets(goals, reason="formation sleeve entry")
+        if sl["state"] == "hold" and age is not None and age >= FORM_EXIT[0]:
+            sl["state"] = "exit"; sl["last"] = -1e9
+        if sl["state"] == "exit":
+            if age is not None and age >= FORM_EXIT[1]:
+                syms = self._sleeve_syms()
+                sl["state"] = "done"
+                left = {s: self.broker.position(s) for s in syms if self.broker.position(s)}
+                self.broker.set_targets({s: (self.broker.position(s), None, 0.0) for s in syms}, reason="formation sleeve done")
+                self.log("FORMATION SLEEVE done: leftover handed to the in-storm model", leftover=left)
+            elif now - sl["last"] >= 3.0:
+                sl["last"] = now
+                goals = {}
+                for s in self._sleeve_syms():
+                    p = self.broker.position(s)
+                    if p and s in self.quotes:
+                        mid = sum(self.quotes[s]) / 2; d = 1 if p > 0 else -1
+                        goals[s] = (0, mid * (1 - d * FORM_BAND), abs(p) * abs(dirs[s]["move"]), FORM_BAND)
+                if goals:
+                    self.broker.set_targets(goals, reason="formation sleeve exit")
+
     def tick(self):
         """Called every second by live.py: snipe unwinds, the announcement follower, stub quotes."""
         if self.replaying:
@@ -293,13 +395,15 @@ class Strategy:
             self.follow.clear(); self.snipes.clear()            # the brake stops every automatic trade; positions are held
             self.broker.sync_stubs({})
             return
+        self._sleeve_tick(now)
         # 0. rounds 1-2: be flat before the next storm forms (its formation reprices everything). An exit whose cap
         #    went stale -- the price drifted past it, live season 74 r1 carried HAVEN -142 into the next storm and
         #    lost ~$1.1k on the jump -- is retried from the current mid every LEFTOVER_RETRY s once a report is out.
         st = self.storm
         if (self.reflatten and st is not None and st.dissipated and st.round not in self.hold_rounds
                 and self.report_t is not None and now - self.last_flatten_t >= LEFTOVER_RETRY):
-            left = {x: self.broker.position(x) for x in self.limits if self.broker.position(x) and x not in self.follow}
+            left = {x: self.broker.position(x) for x in self.limits
+                    if self.broker.position(x) and x not in self.follow and x not in self._sleeve_syms()}
             if left:
                 self.log("LEFTOVER re-flatten from current mid", positions=left)
                 self.flatten_leftovers()
@@ -500,7 +604,7 @@ class Strategy:
             return
         self.last_flatten_t = self.clock()
         goals = {}
-        for s in self.in_storm_syms:
+        for s in self.in_storm_syms - self._sleeve_syms():
             if s in self.quotes:
                 bid, ask = self.quotes[s]
                 mid, half, cur = (bid + ask) / 2, (ask - bid) / 2, self.broker.position(s)
@@ -532,7 +636,8 @@ class Strategy:
         """Positions the post-storm flatten could not close (cap too tight): retry from current mids."""
         if not self.reflatten or self.storm is None or not self.storm.dissipated or self.storm.round in self.hold_rounds:
             return
-        self.in_storm_syms |= {s for s in self.limits if self.broker.position(s) != 0 and s not in self.follow}
+        self.in_storm_syms |= {s for s in self.limits if self.broker.position(s) != 0 and s not in self.follow
+                               and s not in self._sleeve_syms()}
         self.flatten_in_storm("re-flatten after report", after_report=True)
 
     def final_snipe(self):

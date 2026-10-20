@@ -45,16 +45,20 @@ def fillable(levels, side_buy: bool, cap: float) -> int:
 
 
 class Goals:
-    """Shared goal book: symbol -> (target, cap, priority, reason)."""
+    """Shared goal book: symbol -> (target, cap, priority, reason, band). A goal is (target, cap, priority) or
+    (target, cap, priority, band): with a band, no order is priced further than band x the CURRENT mid from mid,
+    whatever the cap (the formation sleeve uses it: take only what is offered near mid, come back next refresh)."""
 
     def __init__(self, limits):
         self.limits, self.g, self.lock = limits, {}, threading.Lock()
 
     def set(self, goals: dict, reason: str):
         with self.lock:
-            for s, (tgt, cap, prio) in goals.items():
+            for s, g in goals.items():
+                tgt, cap, prio = g[:3]
+                band = float(g[3]) if len(g) > 3 and g[3] is not None else None
                 tgt = max(-self.limits[s], min(self.limits[s], int(tgt)))
-                self.g[s] = (tgt, None if cap is None else float(cap), float(prio), reason)
+                self.g[s] = (tgt, None if cap is None else float(cap), float(prio), reason, band)
 
     def clear(self):
         with self.lock:
@@ -105,7 +109,7 @@ class SimBroker:
 
     def tick(self, force=False):
         now = self.clock()
-        for s, (tgt, cap, _, reason) in self.goals.items():
+        for s, (tgt, cap, _, reason, band) in self.goals.items():
             if cap is None:
                 continue                                   # HOLD: do not trade
             d = tgt - self.pos.get(s, 0)
@@ -113,6 +117,9 @@ class SimBroker:
                 continue
             self.last_try[s] = now
             buy = d > 0
+            if band is not None:
+                mid = (self.quotes[s][0] + self.quotes[s][1]) / 2
+                cap = min(cap, mid * (1 + band)) if buy else max(cap, mid * (1 - band))
             epoch = int(now // self.refresh)
             ep, taken = self.used.get((s, buy), (epoch, 0))
             taken = taken if ep == epoch else 0          # liquidity we already took since the last refresh
@@ -246,7 +253,7 @@ class LiveBroker:
         now = time.monotonic()
         if now - self.last_frame > DEAD_FEED:
             return                                         # feed is dead: our view of the book is stale
-        for s, (tgt, cap, _, reason) in self.goals.items():
+        for s, (tgt, cap, _, reason, band) in self.goals.items():
             if s in self.working:
                 t0, ki, oid = self.working[s]
                 if now - t0 < CANCEL_AFTER:
@@ -267,6 +274,9 @@ class LiveBroker:
             if d == 0 or s not in self.quotes or now - self.last_try.get(s, -1e9) < RETRY_GAP:
                 continue
             buy = d > 0
+            if band is not None:                           # never price further than band x mid from the current mid
+                mid = (self.quotes[s][0] + self.quotes[s][1]) / 2
+                cap = min(cap, mid * (1 + band)) if buy else max(cap, mid * (1 - band))
             price = to_tick(cap, buy)
             bids, asks = self.books.get(s, ([], []))
             q = min(abs(d), fillable(asks if buy else bids, buy, price)) if (bids or asks) else 0

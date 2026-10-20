@@ -1,0 +1,181 @@
+{
+ "source": "research seasons 161-600 (no overlap with testnet seasons 61-160)",
+ "entry_window_s_after_open": [
+  20,
+  58
+ ],
+ "exit_window_s_after_open": [
+  70,
+  88
+ ],
+ "rounds": {
+  "1": {
+   "AQUA": {
+    "move": 0.5191,
+    "price": 27.046,
+    "same_sign_share": 0.8,
+    "n": 440
+   },
+   "FERRY": {
+    "move": 0.5811,
+    "price": 18.139,
+    "same_sign_share": 0.757,
+    "n": 440
+   },
+   "GEN": {
+    "move": -0.586,
+    "price": 40.243,
+    "same_sign_share": 0.823,
+    "n": 440
+   },
+   "GRID": {
+    "move": 1.0062,
+    "price": 36.295,
+    "same_sign_share": 0.855,
+    "n": 440
+   },
+   "HAVEN": {
+    "move": 3.8617,
+    "price": 38.139,
+    "same_sign_share": 0.891,
+    "n": 440
+   },
+   "ISLE": {
+    "move": 0.7315,
+    "price": 49.973,
+    "same_sign_share": 0.759,
+    "n": 440
+   },
+   "MAT": {
+    "move": -0.4006,
+    "price": 35.946,
+    "same_sign_share": 0.918,
+    "n": 440
+   },
+   "PORT": {
+    "move": 1.9434,
+    "price": 71.615,
+    "same_sign_share": 0.725,
+    "n": 440
+   },
+   "RECON": {
+    "move": -0.6711,
+    "price": 52.569,
+    "same_sign_share": 0.832,
+    "n": 440
+   }
+  },
+  "2": {
+   "AQUA": {
+    "move": 0.5218,
+    "price": 27.078,
+    "same_sign_share": 0.777,
+    "n": 440
+   },
+   "FERRY": {
+    "move": 0.5081,
+    "price": 18.06,
+    "same_sign_share": 0.736,
+    "n": 440
+   },
+   "GEN": {
+    "move": -0.5451,
+    "price": 40.181,
+    "same_sign_share": 0.786,
+    "n": 440
+   },
+   "GRID": {
+    "move": 0.938,
+    "price": 36.299,
+    "same_sign_share": 0.823,
+    "n": 440
+   },
+   "HAVEN": {
+    "move": 3.7942,
+    "price": 38.202,
+    "same_sign_share": 0.866,
+    "n": 440
+   },
+   "ISLE": {
+    "move": 0.6921,
+    "price": 50.03,
+    "same_sign_share": 0.757,
+    "n": 440
+   },
+   "MAT": {
+    "move": -0.4024,
+    "price": 35.92,
+    "same_sign_share": 0.855,
+    "n": 440
+   },
+   "PORT": {
+    "move": 1.9573,
+    "price": 71.527,
+    "same_sign_share": 0.711,
+    "n": 440
+   },
+   "RECON": {
+    "move": -0.6898,
+    "price": 52.514,
+    "same_sign_share": 0.827,
+    "n": 440
+   }
+  },
+  "3": {
+   "AQUA": {
+    "move": 0.6133,
+    "price": 27.03,
+    "same_sign_share": 0.798,
+    "n": 440
+   },
+   "FERRY": {
+    "move": 0.6279,
+    "price": 18.001,
+    "same_sign_share": 0.795,
+    "n": 440
+   },
+   "GEN": {
+    "move": -0.6141,
+    "price": 40.163,
+    "same_sign_share": 0.825,
+    "n": 440
+   },
+   "GRID": {
+    "move": 1.0553,
+    "price": 36.259,
+    "same_sign_share": 0.841,
+    "n": 440
+   },
+   "HAVEN": {
+    "move": 3.7361,
+    "price": 38.686,
+    "same_sign_share": 0.841,
+    "n": 440
+   },
+   "ISLE": {
+    "move": 0.8889,
+    "price": 50.033,
+    "same_sign_share": 0.825,
+    "n": 440
+   },
+   "MAT": {
+    "move": -0.4353,
+    "price": 35.883,
+    "same_sign_share": 0.866,
+    "n": 440
+   },
+   "PORT": {
+    "move": 1.825,
+    "price": 71.605,
+    "same_sign_share": 0.714,
+    "n": 440
+   },
+   "RECON": {
+    "move": -0.7245,
+    "price": 52.382,
+    "same_sign_share": 0.814,
+    "n": 440
+   }
+  }
+ }
+}
