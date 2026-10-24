@@ -131,7 +131,10 @@ If it was *not* running for an earlier storm of the season, the outage history i
 
 ## Manual controls (`bot/control.json`)
 
-Write one JSON command to `bot/control.json`. The bot reads it within 2 s and deletes it, and its state is kept.
+Write one JSON command to `bot/control.json`, or use the helper, which writes it safely and reports whether the bot
+picked it up: `python3 bot/ctl.py resume GEN REBLD | resume all | announce GEN | fair GEN -3 | pause GEN | halt | go |
+flatten | sleeve 0`. The bot reads the file within 2 s and deletes it, and its state is kept. A malformed file is
+deleted too and reported (ALERT `control file error`), so a typo never blocks the next command.
 
 | Command | Effect |
 |---|---|
@@ -139,10 +142,13 @@ Write one JSON command to `bot/control.json`. The bot reads it within 2 s and de
 | `{"halt": false}` | Release the brake (this also ends a flatten). |
 | `{"flatten": true}` | Close every position within 1% of mid, retrying from the current mid every 20 s until flat, then stay halted. Any entry still being worked is stopped. |
 | `{"close": ["ARCH"]}` | Close these positions within 1% of mid. |
-| `{"pause": ["GEN"]}` / `{"resume": ["GEN"]}` | Stop or restart trading these symbols. Announcements pause their symbols automatically. |
+| `{"pause": ["GEN"]}` / `{"resume": ["GEN"]}` | Stop or restart trading these symbols. Announcements pause their symbols automatically. Resuming a stock frozen by an announcement recalibrates our value of it first; during a storm that and the resume wait for the next round start (see "Announcements"). |
+| `{"announce": ["GEN"]}` | Handle an announcement the bot missed, exactly as if it had arrived: freeze GEN and its ETF, go flat, remember the pre-news gap for the recalibration. |
+| `{"fair": {"GEN": -3}}` | Optional, after an announcement: shift our value of GEN by −$3/share for the rest of the season instead of the automatic recalibration (`0` clears). |
+| `{"follow": true}` / `{"follow": false}` | Announcement follower on / off (off by default). |
 | `{"sleeve": 0}` / `{"sleeve": 0.2}` | Formation sleeve off / back on (fraction of each limit). Off stops new entries at once; a sleeve position already built is still closed by its exit after formation, or treated like any leftover before formation. Paused symbols are never traded by the sleeve. |
 
-The brake and pauses are not saved: **a restart releases them.** Nothing in the bot turns the brake on by itself;
+The brake, manual pauses and fair adjustments are not saved: **a restart releases them.** Announcement freezes do come back, because the bot replays the recorded news at startup. Nothing in the bot turns the brake on by itself;
 only these commands do. The change was checked on 10 replayed seasons with fixed inputs, where results were
 identical to the cent, and with fake-exchange tests 9a–9e.
 
@@ -352,6 +358,7 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 | `strategy.py` | When to trade; goals = (target, price cap, priority[, band: no order further than band x mid from mid]) |
 | `broker.py` | Works goals against the book: a limit order at the cap for the depth available within it, cancel after 2 s, retry every 3 s, positions polled every 1 s, one rate budget per key, PnL ledger |
 | `engine.py` | Live features, identical to the research features (`replay.py --parity`) |
+| `ctl.py` | Sends one manual command to the running bot (resume, announce, fair, pause, halt, go, flatten, sleeve) |
 | `train.py` | `models.pkl` (all 600 seasons) and `models_holdout100.pkl` (seasons 1–500, for honest replays) |
 | `replay.py` | Runs research seasons through the same code (`--book` for realistic depth) |
 | `book_profile.py` | Depth model from recorded books (it grows as more books are recorded, so replay results drift slightly over time) |
@@ -370,66 +377,81 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 - the opening fade
 - announcement handling beyond the pause and the follower: see "Announcements" below
 
-## Announcements: open question, input wanted
+## Announcements
 
-**What the case packet says**
-- An announcement "changes the economics of a company from that time" (§2), at any time in the season
-  (§4). The message names the affected companies in `symbols` (appendix). It does **not** give the
-  direction, the size, or the effect on related companies; the headline is free text.
+**What the case packet says** (checked against "CTC 2026 Case Packet", 2026-10-24)
+- An announcement is "a company or government action that changes the economics of a company from that time",
+  at any time in the season. It arrives on the market-data WebSocket's `news` channel, which the bot subscribes
+  to, and the terminal's Storm Watch screen shows the same feed. Its shape:
+  `{"type": "announcement", "round", "storm", "time", "headline": "<what changed>", "symbols": ["<ticker>"], "seq"}`.
+  `symbols` lists the companies. It does **not** give the direction or the size; the headline is free text.
+  A plain `news` message is only a headline; the bot ignores those.
+- The feed does not resend messages missed while disconnected. Every snapshot (every 30 s) lists the last 8
+  headline messages, as summaries (type, seq, time, headline: no `symbols` in the testnet's snapshots).
 - The house "reacts slowly. After an announcement, it takes about 45 real seconds to adjust fully" (§5).
 - The research data and the testnet have **no** announcements (§6, §7; none in our 18,584 recorded feed
   messages either). We have zero real examples, so everything below is tested only on the fake exchange.
 
-**What the bot does today** (`strategy.py`, `on_news`)
-1. **Pause.** It stops trading the named stocks, and any ETF that contains them, for the rest of the season.
-   That covers in-storm trading and the round-3 final-report trade. Positions are held. Only
-   `{"resume": [...]}` restarts them. If no named symbol is recognized, it pauses everything.
-2. **Follower.** It watches the house price for 6 s. If the price moved at least 0.75%, it trades half the
-   position limit in that direction, paying at most one more "first move". It exits 50 s after the
-   announcement, or sooner if the price gives back half of the first move. It does not read the headline.
-   `{"halt": true}` stops it.
+**The workflow** (decided 2026-10-23: freeze, trade by hand, resume; `strategy.py` `on_news`/`tick`/`resume`)
+1. **Announcement → ALERT.** The named stocks, and any ETF holding them, are frozen: the in-storm model, the
+   formation sleeve and the round-3 final-report trade leave them alone. If no named symbol is recognized,
+   everything is frozen. The monitor alerts every announcement step (never throttled).
+2. **The bot goes flat in them.** Any position in the symbols this announcement froze is closed within 1% of the
+   current mid, retried from the current mid every 20 s until flat (ALERT `ANNOUNCEMENT - FLAT`). A stock frozen by an
+   earlier announcement, that you may be trading by hand, is not touched. With the brake on, it closes once the brake
+   is released. **Wait for the FLAT alert before trading the stock by hand**, or the closing may undo your trade. Then it holds: a position you open by hand
+   afterwards is left alone. The brake (`{"halt": true}`) stops the closing.
+3. **You trade it by hand if you want** (web terminal, same team account). The monitor books your trades at mid and
+   labels them as manual trades in a frozen stock, so they are not blamed on the bot. Remember: in rounds 1–2 the bot closes
+   everything when the storm ends, your positions in the frozen stock included; in round 3 it holds to settlement.
+4. **Close your position (or let the storm's end do it), then resume:** `python3 bot/ctl.py resume GEN REBLD`
+   (or `python3 bot/ctl.py resume all`; the raw command is `{"resume": ["GEN", "REBLD"]}` in `bot/control.json`).
+   The bot recalibrates and takes it from there. Nothing else to type:
+   - **Recalibration:** our value of the stock is shifted so its gap to the price is back where it was before the
+     news (measured just before the news if it came between storms, otherwise at the start of that round). That
+     removes exactly what the news did to the price. A new season clears it.
+   - **Resume between storms:** recalibrated and unfrozen at once (ALERT `ANNOUNCEMENT - RECALIBRATED`).
+   - **Resume during a storm:** the measurement would be noisy, so the stock stays frozen (ALERT `ANNOUNCEMENT -
+     RESUME SCHEDULED`) and is recalibrated and unfrozen automatically at the next round start, before the sleeve
+     enters.
+   - **The ETF** frozen with the stock resumes together with it.
+   - **Override:** `{"fair": {"GEN": -3}}` sets the shift yourself (−$3/share on our value of GEN for the rest of the
+     season; ETFs follow by basket weight; `0` clears). After a manual `fair`, `resume` is immediate, even mid-storm.
+   - **After a restart** the freeze comes back (the bot replays the recorded news) but the measurement from before
+     the news is gone: on resume the recalibration then sets our value to the market price (typically off by
+     ~0.3–1% of price; HAVEN ~4%). Use `{"fair"}` if you know better. A shift set before the restart is not kept.
+5. **An announcement the bot missed** (it was disconnected for a moment): it shows in the next snapshot's
+   headlines. If that entry names its symbols, the bot handles it as usual. If not, nothing is frozen and an ALERT
+   (`ANNOUNCEMENT MISSED - SEEN ONLY IN A SNAPSHOT`) gives the headline; then `python3 bot/ctl.py announce GEN` runs
+   the usual handling (freeze, flat, recalibration on resume) for the stocks you name, measured from the round's
+   start since the house has already moved. A typo is rejected.
+6. **Follower: off by default.** With `{"follow": true}` it trades half the limit in the direction of the house's first
+   6 s after the news, for up to 50 s. It is off because it was never tested (no announcements in any data) and it
+   races every other team reading the same headline. Don't switch it on while you trade by hand.
 
-**Known problems with today's behavior**
-- **Oversized trades.** If the bot already holds the stock, the follower can trade up to 1.5× the limit. For
-  example, long 600 GEN becomes short 300, a 900-share sale through a book that is moving on the news.
-- **Stale exit.** The follower's exit returns to the pre-announcement position, which is a bet made with
-  the old economics.
-- **Knock-on effects are missed.** For example, "GRID buries its power lines" helps GRID but hurts GEN (fewer
-  outages), RECON (less repair work) and HAVEN (fewer insured losses). The announcement may name only GRID.
+**How accurate the recalibration is.** Measured on 180 round starts in 60 research seasons: with no news, the gap
+between our formula and the price moves from one round start to the next by a median of GEN 0.3%, MAT 0.3%, RECON
+0.4%, GRID 0.4%, ISLE 0.5%, FERRY 0.5%, AQUA 0.6%, PORT 0.65%, HAVEN 2.6% of price; that is the recalibration's
+typical error. Measured inside a storm instead, 60 s of normal trading moves it by up to 1.3–6% (HAVEN 13%), which is
+why a resume asked for mid-storm waits for the next round start.
 
-**Why a paused stock can't simply resume next round.** The house's *price* adjusts within about 45 s, but our
-*valuation formula* for the company does not. The formula was fitted to the 600 research seasons
-(`analysis/value.py`). The model trades on the gap between that formula and the house price, so an
-unadjusted formula shows a phantom mispricing in every storm. The round-3 final-report trade then bets the
-full limit on it.
-- **A one-time hit.** "GEN pays a $3 fine": the house drops GEN by $3 and the formula doesn't. The bot thinks
-  GEN is $3 cheap and buys up to 600 shares, about −$1,800 if held to settlement.
-- **A change in how the company reacts to storms.** "GEN can supply only half its generators": no single
-  shift of the formula fixes this.
+**Why the recalibration matters.** The model's inputs include, for *every*
+stock, the gap between our formula's value and the house price. The house reprices an announced company within
+~45 s; our formula doesn't. So:
+- **The announced stock looks mispriced.** "GEN pays a $3 fine": the house drops GEN by $3, the formula doesn't,
+  and a resumed bot thinks GEN is $3 cheap and buys up to 600 shares (about −$1,800 if held to settlement).
+- **The fake gap leaks into the other stocks.** On the bot's decisions replayed from 10 research seasons, a GEN
+  repricing of 5–10% with the formula unchanged changes 6–10% of the other eight stocks' trade decisions (PORT
+  1–5%, HAVEN 1–4%). The recalibration removes the fake gap; until you resume, the other stocks see it.
 
-**Proposal under discussion (Brian)**
-1. On an announcement, pause the stock automatically, and probably the ETF that holds it. The bot already
-   does this.
-2. A human reads the headline and trades the stock by hand for the rest of that round, deciding direction,
-   size and any knock-on stocks.
-3. Turn the algorithm back on for that stock in a later round, or whenever the humans judge the news is
-   absorbed.
-
-**Claude's assessment.** The structure is good. Humans read a headline, its direction and its knock-on
-effects better than the bot, and the algorithm keeps trading every other stock. These additions would
-make it safe:
-- **Re-anchor on resume.** On `{"resume": ["GEN"]}`, the bot should measure how far the house moved relative
-  to our formula across the announcement, and shift the formula by that amount for the rest of the season.
-  This fixes one-time hits exactly; for changes in storm sensitivity it is only approximate.
-- **Skip the round-3 final-report trade for an announced stock** (and its ETF) unless a human is confident of
-  the new value. It is the full-limit bet that depends most on an exact formula.
-- **Manual positions carry over.** Resuming hands the algorithm whatever position the humans hold, and it
-  trades from there. For example, if you are short 300 GEN and the model wants long 600, it buys 900.
-- **Keep the follower only as a fallback** for when nobody is at the keyboard. Fix its problems first: at
-  most half the limit measured from flat, and exit to flat.
-- **Pausing the ETF is sensible and cheap.** An ETF's value is its basket, so a wrong component value makes it
-  wrong, diluted by the component's weight (table below). The bot trades ETFs only in the round-3
-  final-report trade, and they earn little (ARCH about $86 and REBLD about $36 per season).
+**What it does not fix**
+- **A change in how the company reacts to storms** ("GEN can supply only half its generators"): no single shift
+  fixes this. Keep the stock frozen for the season.
+- **Knock-on effects.** "GRID buries its power lines" helps GRID but hurts GEN (fewer outages), RECON (less repair
+  work) and HAVEN (fewer insured losses). Only the named companies are frozen; freeze others by hand
+  (`{"pause": [...]}`) if the headline calls for it.
+- **Manual positions carry over at resume.** Resuming hands the algorithm whatever position you hold, and it
+  trades from there (short 300 GEN with the model wanting long 600 means it buys 900). Close it before resuming.
 
 **What pausing a stock gives up.** Average profit per season, current settings, 200 unseen seasons
 (total $9,007):
@@ -442,13 +464,11 @@ make it safe:
 - ARCH: PORT 25%, AQUA 19%, ISLE 17%, HAVEN 14%, GRID 13%, FERRY 12%.
 - REBLD: RECON 48%, MAT 33%, GEN 19%.
 
-**Questions for reviewers**
-1. During the announcement round: manual trading, the automatic follower, or both?
-2. When to resume the algorithm on that stock: automatically next round (with re-anchoring), or only by hand?
-3. The round-3 final-report trade for an announced stock: skip it, or allow it with the re-anchored value?
-4. Pause the ETF too? Pause obvious knock-on stocks automatically (for example, a GRID announcement also
-   pauses GEN and RECON), or leave that to the humans?
-5. Follower size: half the limit, full, or off?
+**Open questions for reviewers**
+1. Freeze obvious knock-on stocks automatically (a GRID announcement also freezes GEN and RECON), or leave it to
+   the humans as now?
+2. A resume asked for during a storm waits for the next round start, so the stock sits out the rest of that storm.
+   Fine, or resume mid-storm with a noisier recalibration?
 
 ## Before the competition
 
