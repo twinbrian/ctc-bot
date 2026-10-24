@@ -1,4 +1,5 @@
-"""Build a per-symbol order-book depth profile from recorded testnet books (bot/logs/books-*.jsonl).
+"""Build a per-symbol order-book depth profile from recorded books: bot/logs_testnet/ (the testnet recordings, moved
+out before the competition) and bot/logs/ (the current run), books-*.jsonl.
 
 profile[s] = [(offset from mid as a fraction, qty), ...]  -- median cumulative depth on one side
 """
@@ -14,12 +15,17 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 GRID = np.array([0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05])
+LOG_DIRS = (ROOT / "bot" / "logs_testnet", ROOT / "bot" / "logs")
+
+
+def _files(pattern):
+    return [f for d in LOG_DIRS for f in sorted(glob.glob(str(d / pattern)))]
 
 
 def storm_windows():
     """(start, end) wall-clock windows of storms seen in the run logs (storm_formed + 480 s)."""
     out = []
-    for r in sorted(glob.glob(str(ROOT / "bot" / "logs" / "run-*.jsonl"))):
+    for r in _files("run-*.jsonl"):
         for line in open(r):
             e = json.loads(line)
             if e["event"] == "storm_formed":
@@ -29,7 +35,7 @@ def storm_windows():
 
 def build(paths=None, storm_only=True):
     """Depth profile; by default only from books recorded while a storm was live (wider, thinner)."""
-    paths = paths or sorted(glob.glob(str(ROOT / "bot" / "logs" / "books-*.jsonl")))
+    paths = paths or _files("books-*.jsonl")
     wins = storm_windows() if storm_only else []
     cum = {}
     for p in paths:

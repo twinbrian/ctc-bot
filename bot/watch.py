@@ -37,7 +37,10 @@ SUDDEN, SUDDEN_WIN = 6000.0, 60.0           # $6k lost within 60 s
 DEEPEN, RECOVER = 4000.0, 3000.0            # one alert per incident: again only if $4k worse; a new incident needs every
                                             # rule to clear AND a $3k recovery (no repeats while hovering at a threshold)
 TYPICAL_COST_BP = 46.0                      # execution cost vs mid on 2026-10-18: 46 bp of value traded (90th pct per round 87)
-BOT_EVENTS = ("error", "ORDER REJECTED", "DISCONNECTED", "PREDICTION REJECTED (implausible)",
+# announcements need a human: every one is alerted (no 5-minute throttle)
+ALWAYS = ("ANNOUNCEMENT - PAUSED", "ANNOUNCEMENT - FLAT", "ANNOUNCEMENT - RESUME SCHEDULED", "ANNOUNCEMENT - RECALIBRATED",
+          "control command error", "control file error", "ANNOUNCEMENT MISSED - SEEN ONLY IN A SNAPSHOT")          # a manual command that did not take effect
+BOT_EVENTS = ALWAYS + ("error", "ORDER REJECTED", "DISCONNECTED", "PREDICTION REJECTED (implausible)",
               "ROUND STOP-LOSS: flattening and sitting out the rest of the storm")
 HEALTH = ("ORDER REJECTED", "DISCONNECTED", "error", "rate budget exhausted (lower-priority symbols wait)",
           "PREDICTION REJECTED (implausible)", "LEFTOVER re-flatten from current mid")
@@ -303,6 +306,20 @@ def _storm_lines(D, rd, t_ref, t):
     return lines, surprise
 
 
+def frozen_at(D, t):
+    """Symbols frozen at time t: the bot's CONTROL lines give the whole frozen set after each command, an
+    announcement adds its symbols, RESUMED removes one."""
+    frozen = set()
+    for ts, e, r in D.events:
+        if ts > t:
+            break
+        if e == "ANNOUNCEMENT - PAUSED" or e == "CONTROL":
+            frozen = set(r.get("paused") or [])
+        elif e == "RESUMED":
+            frozen.discard(r.get("symbol"))
+    return frozen
+
+
 def diagnose_live(D, t, known, rd, t_ref):
     """Why the round's PnL fell between t_ref and t. Returns (cause, lines)."""
     _, pos_ref, _ = D.season_value(t_ref, known)
@@ -348,7 +365,9 @@ def diagnose_live(D, t, known, rd, t_ref):
     rs = sum(1 for x in D.restarts if w0 < x <= t and D.season_value(x, known)[1])
     sts = [s_ for s_ in D.status if w0 <= s_[0] <= t]
     gap = max((b_[0] - a_[0] for a_, b_ in zip(sts, sts[1:]) if a_[1]), default=0.0)
-    syn = sum(1 for x in fl if x[4] and w0 <= x[0] <= t)
+    frozen = frozen_at(D, t)                                   # stocks frozen by an announcement: humans trade them
+    syn = sum(1 for x in fl if x[4] and w0 <= x[0] <= t and x[1] not in frozen)
+    manual = sum(1 for x in fl if x[4] and w0 <= x[0] <= t and x[1] in frozen)
     serious = dict(near)
     if rs: serious["restart"] = rs
     if gap > 25: serious[f"bot silent for {gap:.0f} s"] = 1
@@ -390,6 +409,9 @@ def diagnose_live(D, t, known, rd, t_ref):
         ctx["restart"] = ctx_rs
     lines.append("bot health this round: " + (", ".join(f"{h} {n}" for h, n in ctx.items()) if ctx else "no errors, rejects, disconnects or restarts")
                  + (f" | NEAR THE DROP: {serious}" if serious else ""))
+    if manual:
+        lines.append(f"manual trades: {manual} position change(s) in stocks frozen by an announcement {sorted(frozen)} "
+                     f"(the bot did not make them; booked at mid)")
     for s, why in flagged.items():
         lines.append(f"CHECK {s}: {why} (${by[s]['total']:,.0f} in the window)")
     if loss >= 0:
@@ -433,6 +455,9 @@ def diagnose_live(D, t, known, rd, t_ref):
 def live_watch(D, st, now, emit):
     """One check at time `now`. emit(kind, message, lines) is called for every alert."""
     last = D.last_status_t(now)
+    rs = [x for x in D.restarts if x <= now]
+    if rs and (last is None or rs[-1] > last):
+        last = rs[-1]          # a bot that just started is alive until its first status line is due (2026-10-24 00:02)
     if last is not None and now - last > SILENT:
         if not st.get("silent"):
             emit("BOT SILENT", f"no bot status line for {now - last:.0f} s (process down, frozen, or the Mac asleep?)", [])
@@ -441,8 +466,8 @@ def live_watch(D, st, now, emit):
     st["silent"] = False
     t_ev = st.get("ev_t", now - 15)
     for ts, e, r in D.events:
-        if t_ev < ts <= now and e in BOT_EVENTS and now - st.setdefault("ev_last", {}).get(e, 0) > 300:
-            st["ev_last"][e] = now
+        if t_ev < ts <= now and e in BOT_EVENTS and (e in ALWAYS or now - st.setdefault("ev_last", {}).get(e, 0) > 300):
+            st.setdefault("ev_last", {})[e] = now
             emit("BOT EVENT", f"{e}: " + json.dumps({k: v for k, v in r.items() if k not in ("ts", "event")})[:300], [])
     st["ev_t"] = now
     t = now - LAG

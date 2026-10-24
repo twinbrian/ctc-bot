@@ -473,7 +473,7 @@ def report(rounds, seen, st):
         rep = honest_replay(r["season"], epoch)
         rp = rep.get(r["round"]) if rep else None
         rep_total = sum(rp.values()) if rp else None
-        rep2 = honest_replay(r["season"], epoch, live_model=True) if rep is not None else None
+        rep2 = honest_replay(r["season"], epoch, live_model=True)      # even without an honest model for this season
         rp2 = rep2.get(r["round"]) if rep2 else None
         rep2_total = sum(rp2.values()) if rp2 else None
         sleeve = r["diag"].get("sleeve_pnl", 0.0)
