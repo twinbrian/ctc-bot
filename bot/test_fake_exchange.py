@@ -261,6 +261,7 @@ def main():
     wait(3.5, lambda: (refresh(), st.tick()))
     check(f"11f the first running-clock snapshot times the open (29 s) and the sleeve enters from {FE[0]:.0f} s",
           st.round_open is not None and st.sleeve["state"] == "entry" and fx.pos == tgt, f"sleeve {st.sleeve}, pos {fx.pos}")
+    S.ANNOUNCE_FLATTEN = True              # tests 11g-20 cover the closing mechanics (off by default since 2026-10-24)
     # an announcement on a symbol the sleeve holds: the sleeve hands it over (paused; only the follower may trade it)
     fx = FakeExchange(); st, b, ev, refresh = setup(fx)
     st.form_frac = 0.2
@@ -501,6 +502,32 @@ def main():
     check("20 control file: broken JSON and a non-object are consumed and reported, the next command is read, no file = none",
           r1 is None and gone1 and r2 is None and gone2 and r3 == {"halt": True} and r4 is None
           and elog == ["control file error", "control file error"], f"{r1} {r2} {r3} {r4} {elog}")
+
+    # 21. the default (2026-10-24): an announcement freezes but keeps the position; pause = the same freeze; after
+    #     trading by hand, resume hands the bot whatever position you hold
+    S.ANNOUNCE_FLATTEN = False
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    fx.pos, fx.avg = -50, 40.0; wait(1.2, refresh)
+    st.on_news(ann(15)); wait(2.5, lambda: (refresh(), st.tick()))
+    check("21a an announcement freezes the stock (and its ETF) and keeps the position as it is (no automatic close)",
+          fx.pos == -50 and {SYM, "ARCH"} <= st.paused and not st.closing, f"pos {fx.pos}, paused {sorted(st.paused)}")
+    for how in ("announcement", "pause"):
+        fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+        b.set_targets({SYM: (300, 39.90, 1.0)}, reason="in-storm r1 age 50", urgent=True); wait(1.5, refresh)  # unfilled entry
+        if how == "announcement":
+            st.on_news(ann(16))
+        else:
+            LV.apply_control(st, {"pause": [SYM]}, lambda e, **kw: None)
+        fx.mid = 39.70; wait(4.0, refresh)                       # the market moves through the old entry cap
+        check(f"21{'b' if how == 'announcement' else 'c'} {how}: the bot's open entry is cancelled -- nothing is bought after it"
+              + (" (pause = exactly the freeze: ETF too, resume will recalibrate)" if how == "pause" else ""),
+              fx.pos == 0 and {SYM, "ARCH"} <= st.paused and SYM in st.gap_before, f"pos {fx.pos}, paused {sorted(st.paused)}")
+    fx.pos, fx.avg = 30, 39.7; wait(1.2, refresh)                 # a human builds +30 while it is frozen
+    n0 = len(fx.trades)
+    LV.apply_control(st, {"resume": [SYM, "ARCH"]}, lambda e, **kw: None); wait(3.0, lambda: (refresh(), st.tick()))
+    check("21d resume after trading by hand: the bot takes over +30 as its own and does not try to restore the old position",
+          SYM not in st.paused and fx.pos == 30 and len(fx.trades) == n0 and st.broker.position(SYM) == 30,
+          f"pos {fx.pos}, trades {len(fx.trades) - n0}")
 
     print("\nALL PASSED" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1

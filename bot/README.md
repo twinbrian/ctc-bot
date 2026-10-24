@@ -142,8 +142,8 @@ deleted too and reported (ALERT `control file error`), so a typo never blocks th
 | `{"halt": false}` | Release the brake (this also ends a flatten). |
 | `{"flatten": true}` | Close every position within 1% of mid, retrying from the current mid every 20 s until flat, then stay halted. Any entry still being worked is stopped. |
 | `{"close": ["ARCH"]}` | Close these positions within 1% of mid. |
-| `{"pause": ["GEN"]}` / `{"resume": ["GEN"]}` | Stop or restart trading these symbols. Announcements pause their symbols automatically. Resuming a stock frozen by an announcement recalibrates our value of it first; during a storm that and the resume wait for the next round start (see "Announcements"). |
-| `{"announce": ["GEN"]}` | Handle an announcement the bot missed, exactly as if it had arrived: freeze GEN and its ETF, go flat, remember the pre-news gap for the recalibration. |
+| `{"pause": ["GEN"]}` / `{"resume": ["GEN"]}` | Freeze GEN exactly like an announcement does (its ETF too, open orders cancelled, position kept, resume recalibrates) / trade it again. Use it if the automatic freeze ever does not happen. Announcements freeze their symbols automatically. Resuming a stock frozen by an announcement recalibrates our value of it first; during a storm that and the resume wait for the next round start (see "Announcements"). |
+| `{"announce": ["GEN"]}` | Handle an announcement the bot missed, exactly as if it had arrived: freeze GEN and its ETF, cancel open orders, keep the position, remember the pre-news gap for the recalibration (same as `pause`). |
 | `{"fair": {"GEN": -3}}` | Optional, after an announcement: shift our value of GEN by −$3/share for the rest of the season instead of the automatic recalibration (`0` clears). |
 | `{"follow": true}` / `{"follow": false}` | Announcement follower on / off (off by default). |
 | `{"sleeve": 0}` / `{"sleeve": 0.2}` | Formation sleeve off / back on (fraction of each limit). Off stops new entries at once; a sleeve position already built is still closed by its exit after formation, or treated like any leftover before formation. Paused symbols are never traded by the sleeve. |
@@ -396,17 +396,20 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 1. **Announcement → ALERT.** The named stocks, and any ETF holding them, are frozen: the in-storm model, the
    formation sleeve and the round-3 final-report trade leave them alone. If no named symbol is recognized,
    everything is frozen. The monitor alerts every announcement step (never throttled).
-2. **The bot goes flat in them.** Any position in the symbols this announcement froze is closed within 1% of the
-   current mid, retried from the current mid every 20 s until flat (ALERT `ANNOUNCEMENT - FLAT`). A stock frozen by an
-   earlier announcement, that you may be trading by hand, is not touched. With the brake on, it closes once the brake
-   is released. **Wait for the FLAT alert before trading the stock by hand**, or the closing may undo your trade. Then it holds: a position you open by hand
+2. **The bot stops trading them and keeps the position.** Its open orders in them are cancelled (nothing more is
+   bought or sold), and whatever position it holds stays for you to handle: close it, keep it, or add to it once you
+   have read the headline. Closing blind would cost up to 1% and give up a position the news may favour (decided
+   2026-10-24; `ANNOUNCE_FLATTEN = True` in `strategy.py` brings back the automatic close). Then it holds: a position you open by hand
    afterwards is left alone. The brake (`{"halt": true}`) stops the closing.
 3. **You trade it by hand if you want** (web terminal, same team account). The monitor books your trades at mid and
    labels them as manual trades in a frozen stock, so they are not blamed on the bot. Remember: in rounds 1–2 the bot closes
    everything when the storm ends, your positions in the frozen stock included; in round 3 it holds to settlement.
-4. **Close your position (or let the storm's end do it), then resume:** `python3 bot/ctl.py resume GEN REBLD`
+4. **Resume when you are done:** `python3 bot/ctl.py resume GEN REBLD`
    (or `python3 bot/ctl.py resume all`; the raw command is `{"resume": ["GEN", "REBLD"]}` in `bot/control.json`).
-   The bot recalibrates and takes it from there. Nothing else to type:
+   The bot recalibrates and takes it from there. You do **not** need to restore the position from before the freeze:
+   it takes over whatever you hold as its own and trades from there toward its target (hold +300 GEN and the model
+   wants +600: it buys 300 more; it wants −600: it sells 900). If you don't want it to inherit a position, close it
+   before resuming. Nothing else to type:
    - **Recalibration:** our value of the stock is shifted so its gap to the price is back where it was before the
      news (measured just before the news if it came between storms, otherwise at the start of that round). That
      removes exactly what the news did to the price. A new season clears it.
@@ -423,7 +426,7 @@ $1,723 (morning settings, 25 rounds) to $809 (current settings, 8 rounds).
 5. **An announcement the bot missed** (it was disconnected for a moment): it shows in the next snapshot's
    headlines. If that entry names its symbols, the bot handles it as usual. If not, nothing is frozen and an ALERT
    (`ANNOUNCEMENT MISSED - SEEN ONLY IN A SNAPSHOT`) gives the headline; then `python3 bot/ctl.py announce GEN` runs
-   the usual handling (freeze, flat, recalibration on resume) for the stocks you name, measured from the round's
+   the usual handling (freeze, recalibration on resume) for the stocks you name, measured from the round's
    start since the house has already moved. A typo is rejected.
 6. **Follower: off by default.** With `{"follow": true}` it trades half the limit in the direction of the house's first
    6 s after the news, for up to 50 s. It is off because it was never tested (no announcements in any data) and it
@@ -450,8 +453,6 @@ stock, the gap between our formula's value and the house price. The house repric
 - **Knock-on effects.** "GRID buries its power lines" helps GRID but hurts GEN (fewer outages), RECON (less repair
   work) and HAVEN (fewer insured losses). Only the named companies are frozen; freeze others by hand
   (`{"pause": [...]}`) if the headline calls for it.
-- **Manual positions carry over at resume.** Resuming hands the algorithm whatever position you hold, and it
-  trades from there (short 300 GEN with the model wanting long 600 means it buys 900). Close it before resuming.
 
 **What pausing a stock gives up.** Average profit per season, current settings, 200 unseen seasons
 (total $9,007):

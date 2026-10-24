@@ -135,12 +135,12 @@ def apply_control(strat, cmd: dict, log):
     for flag, attr in (("sniper", "sniper_on"), ("follow", "follow_on"), ("stubs", "stubs_on")):
         if flag in cmd:
             setattr(strat, attr, bool(cmd[flag]))
-    strat.paused |= {x for x in names(cmd.get("pause")) if x in strat.limits}
-    if cmd.get("announce"):                                 # an announcement the bot missed: handle it as if received
-        syms = [x for x in names(cmd["announce"]) if x in strat.limits]
-        if not syms:
-            raise ValueError(f"announce: no known ticker in {cmd['announce']!r}")
-        strat.on_news({"type": "announcement", "symbols": syms, "headline": "manual {\"announce\"} command", "manual": True})
+    for word in ("pause", "announce"):                      # both freeze exactly like an announcement: the stock and its
+        if cmd.get(word):                                   # ETF stop trading, open orders are cancelled, and resume
+            syms = [x for x in names(cmd[word]) if x in strat.limits]   # recalibrates (pre-news gap: the round start)
+            if not syms:
+                raise ValueError(f"{word}: no known ticker in {cmd[word]!r}")
+            strat.on_news({"type": "announcement", "symbols": syms, "headline": f"manual {{\"{word}\"}} command", "manual": True})
     for x, v in (cmd.get("fair") or {}).items():            # manual override of the recalibration ($/share)
         if x in strat.limits:
             strat.set_fair(x, float(v))
@@ -237,14 +237,15 @@ async def run(args):
         """Manual control on competition day without stopping the bot (its state is kept). Write bot/control.json:
            {"halt": true}                 the brake: no automatic trading at all, positions held (also no after-storm exit)
            {"halt": false}                resume (also ends a manual flatten)
-           {"pause": ["GRID"]}            stop trading these symbols   {"resume": ["GRID"]} trade them again ("all": all)
+           {"pause": ["GRID"]}            freeze GRID exactly like an announcement does (and its ETF; open orders cancelled,
+                                          position kept)       {"resume": ["GRID"]} trade them again ("all": all)
                                           (a stock frozen by an announcement is recalibrated first; during a storm
                                           that and the resume wait for the next round start)
            {"close": ["ARCH"]}            close these positions within 1% of mid
            {"flatten": true}              close every position within 1% of mid (retried from the current mid every 20 s
                                           until flat), then stay halted
            {"sniper": false} / {"follow": false} / {"stubs": true}   switch the extra strategies
-           {"announce": ["GEN"]}          run the announcement handling for GEN (freeze, go flat, remember the gap for
+           {"announce": ["GEN"]}          run the announcement handling for GEN (freeze, keep the position, remember the gap for
                                           the recalibration) -- for an announcement the bot missed in a disconnect
            {"fair": {"GEN": -3}}          optional override: shift our valuation of GEN by -$3/share for the rest of the
                                           season instead of the automatic recalibration (0 clears; ETFs follow)

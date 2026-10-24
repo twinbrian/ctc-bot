@@ -30,6 +30,8 @@ EXIT_MARGIN = 0.0015                    # after the storm, close within 0.15% of
 REPORT_EXIT_MARGIN = 0.003              # after a damage report the house quote is fair again: close within 0.3% of mid
 LEFTOVER_RETRY = 20.0                   # rounds 1-2: after a report, retry a stuck exit from the current mid this often (s)
 ANNOUNCE_CLOSE = 0.01                   # announcement: close the frozen stocks/ETFs within 1% of the current mid, retried
+ANNOUNCE_FLATTEN = False                # off (2026-10-24): a frozen stock's position is kept for the humans to handle --
+                                        # closing blind costs up to 1% and gives up a position the news may favour
 # Announcement recalibration (on {"resume": [...]}). Our valuation formulas don't know about the news, so after it the
 # model would see a fake gap between our value and the price for that company -- and that gap feeds every stock's
 # model (a 5-10% GEN repricing changes 6-10% of the OTHER stocks' decisions). On resume, our value of the stock is
@@ -233,8 +235,8 @@ class Strategy:
             self._missed_announcements(m)
         elif typ == "announcement":
             # the company's economics changed: the valuation formulas may now be wrong for these symbols.
-            # Stop trading them until a human resumes them via bot/control.json, and get flat in them: a position
-            # we can no longer value is a bet of unknown direction (closed patiently, see tick).
+            # Stop trading them (any open order is cancelled; the position is kept for the humans) until a human
+            # resumes them via bot/control.json. With ANNOUNCE_FLATTEN the position is also closed (see tick).
             syms = [x for x in (m.get("symbols") or []) if x in self.limits] or list(self.limits)
             frozen_now = set(syms) | {x for x in ("ARCH", "REBLD") if any(y in BASKET_OF.get(x, ()) for y in syms)}
             self.paused |= set(syms)
@@ -267,6 +269,8 @@ class Strategy:
                     self.gap_before[x] = (g, self.season_no)
             closing = {x: self.broker.position(x) for x in frozen_now      # only what THIS announcement froze: a stock
                        if self.broker.position(x) and x not in self.follow}   # a human trades from an earlier one stays
+            if not ANNOUNCE_FLATTEN:
+                closing = {}
             if closing and not self.replaying:                  # with the brake on, it closes once the brake is released
                 for x in closing:
                     self.closing[x] = -1e9                      # first attempt on the next tick (within 1 s)

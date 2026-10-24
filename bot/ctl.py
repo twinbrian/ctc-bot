@@ -3,7 +3,7 @@
     python3 bot/ctl.py resume GEN REBLD      after an announcement: recalibrate + trade them again ("resume all": all)
     python3 bot/ctl.py announce GEN          an announcement the bot missed: handle it as if it had arrived
     python3 bot/ctl.py fair GEN -3           optional: set GEN's valuation shift yourself (-$3/share; 0 clears)
-    python3 bot/ctl.py pause GEN             stop trading GEN (no flattening)
+    python3 bot/ctl.py pause GEN             freeze GEN exactly like an announcement (its ETF too; position kept)
     python3 bot/ctl.py halt                  the brake: no automatic trading at all
     python3 bot/ctl.py go                    release the brake
     python3 bot/ctl.py flatten               close everything, then stay halted
