@@ -18,7 +18,7 @@ import numpy as np
 from load import PHYS, STOCKS, SYMS, ISLANDS
 from wind import SX, SY, THR
 from damage import COMP_IDX, W
-from value import values
+from value import values, BASKETS
 from features import posterior, OUTLOOKS
 from nowcast import projected
 
@@ -80,6 +80,8 @@ class Season:
     C_prev: dict = field(default_factory=lambda: {c: 0.0 for c in ("PORT", "GRID", "FERRY")})
     finals: dict = field(default_factory=dict)       # round -> damage_pct dict
     approximate: bool = False                        # True if a storm's track was missed
+    value_offset: dict = field(default_factory=dict) # symbol -> $/share added to our valuation after an announcement
+                                                     # (set by hand: bot/control.json {"fair": {...}}); ETFs follow
 
     def apply_final(self, rnd: int, damage_pct: dict, storm: Storm | None, v: np.ndarray):
         """Add a storm's final damage, split across sites in proportion to the model's site damage."""
@@ -103,6 +105,22 @@ class Season:
         return {c: float((self.D_site[COMP_IDX[c]] * W[COMP_IDX[c]]).sum()) for c in PHYS}
 
 
+def _offset(season: Season, vals: dict) -> dict:
+    """An announcement can change a company's economics; our formulas don't know it. season.value_offset shifts
+    our valuation of that company ($/share, set by hand), and every ETF holding it by its basket weight."""
+    off = season.value_offset
+    if not off:
+        return vals
+    out = dict(vals)
+    for sym, x in off.items():
+        if sym in out:
+            out[sym] += x
+    for etf, basket in BASKETS.items():
+        if etf in out:
+            out[etf] += sum(q * off.get(c, 0.0) for c, q in basket.items())
+    return out
+
+
 def value_with(season: Season, consts, X, Cc, k):
     """Value of every symbol if this storm adds exposure X / closure Cc, then k more average storms."""
     D0, v, q = season.D_site, consts["v"], consts["q"]
@@ -110,14 +128,14 @@ def value_with(season: Season, consts, X, Cc, k):
     Ds = 1 - (1 - (D0 + add)) * (1 - q) ** k
     Dc = {c: float((Ds[COMP_IDX[c]] * W[COMP_IDX[c]]).sum()) for c in PHYS}
     C = {c: season.C_prev[c] + float((Cc[COMP_IDX[c]] * W[COMP_IDX[c]]).sum()) + k * consts["cfut"][c] for c in season.C_prev}
-    return {s: float(x) for s, x in values(Dc, C).items()}
+    return _offset(season, {s: float(x) for s, x in values(Dc, C).items()})
 
 
 def exact_values(season: Season, storm: Storm | None):
     """Settlement values once every storm's final report is in. Damage = the sum of the reported company
     damage (exact); the per-site split caps sites at 100% and must not be used here. Outage from the tracks."""
     D = {c: sum(d[c] for d in season.finals.values()) / 100 for c in PHYS}
-    return {s: float(x) for s, x in values(D, dict(season.C_prev)).items()}
+    return _offset(season, {s: float(x) for s, x in values(D, dict(season.C_prev)).items()})
 
 
 def features(storm: Storm, season: Season, consts, age: int, H: dict, Hpre: dict, Hlag: dict) -> dict:

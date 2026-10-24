@@ -98,6 +98,67 @@ def smoke_test(rest: Rest):
     show("open orders after cancel", rest.call("GET", "/orders/open"))
 
 
+def names(v) -> list:
+    """A control command's symbol list: ["GEN", "REBLD"], or a single "GEN"."""
+    return [v] if isinstance(v, str) else list(v or [])
+
+
+def read_control(control: Path, log):
+    """The pending command in bot/control.json, or None. The file is always consumed, even if malformed, so a typo
+    can never block the next command (the brake included)."""
+    try:
+        if not control.exists():
+            return None
+        text = control.read_text()
+        control.unlink()
+        cmd = json.loads(text)
+        if not isinstance(cmd, dict):
+            raise ValueError(f"not a JSON object: {text[:80]!r}")
+        return cmd
+    except (OSError, ValueError) as exc:
+        log("control file error", error=repr(exc))
+        return None
+
+
+def apply_control(strat, cmd: dict, log):
+    """One manual command from bot/control.json (see control_loop in run() for the list)."""
+    if "halt" in cmd:
+        strat.halted, strat.flattening = bool(cmd["halt"]), False
+        if strat.halted:
+            strat.broker.set_targets({x: (strat.broker.position(x), None, 0.0) for x in strat.quotes}, reason="manual halt")
+    if "sleeve" in cmd:
+        strat.form_frac = max(0.0, min(1.0, float(cmd["sleeve"])))
+        if strat.form_frac == 0.0 and strat.sleeve and strat.sleeve["state"] in ("wait", "entry"):
+            strat.sleeve["state"] = "done"              # stop entering now; held sleeve positions go to the model
+            strat.broker.set_targets({x: (strat.broker.position(x), None, 0.0) for x in strat.sleeve["targets"]},
+                                     reason="formation sleeve stopped")
+    for flag, attr in (("sniper", "sniper_on"), ("follow", "follow_on"), ("stubs", "stubs_on")):
+        if flag in cmd:
+            setattr(strat, attr, bool(cmd[flag]))
+    strat.paused |= {x for x in names(cmd.get("pause")) if x in strat.limits}
+    if cmd.get("announce"):                                 # an announcement the bot missed: handle it as if received
+        syms = [x for x in names(cmd["announce"]) if x in strat.limits]
+        if not syms:
+            raise ValueError(f"announce: no known ticker in {cmd['announce']!r}")
+        strat.on_news({"type": "announcement", "symbols": syms, "headline": "manual {\"announce\"} command", "manual": True})
+    for x, v in (cmd.get("fair") or {}).items():            # manual override of the recalibration ($/share)
+        if x in strat.limits:
+            strat.set_fair(x, float(v))
+    if cmd.get("resume"):                                   # a list, one ticker, or "all" (everything frozen now)
+        strat.resume(sorted(strat.paused) if str(cmd["resume"]).lower() == "all" else names(cmd["resume"]))                         # recalibrates announced stocks first
+    if cmd.get("close"):                                    # close specific symbols within 1% of mid
+        goals = {}
+        for x in names(cmd["close"]):
+            q = strat.broker.position(x)
+            if q and x in strat.quotes:
+                m_ = sum(strat.quotes[x]) / 2
+                goals[x] = (0, m_ * 1.01 if q < 0 else m_ * 0.99, abs(q) * m_)
+        strat.broker.set_targets(goals, reason="manual close", urgent=True)
+    if cmd.get("flatten"):
+        strat.manual_flatten()
+    log("CONTROL", cmd=cmd, halted=strat.halted, paused=sorted(strat.paused))
+
+
 async def run(args):
     key = args.key or os.environ.get("HURRICANE_BOT_KEY")
     if not key:
@@ -176,49 +237,29 @@ async def run(args):
         """Manual control on competition day without stopping the bot (its state is kept). Write bot/control.json:
            {"halt": true}                 the brake: no automatic trading at all, positions held (also no after-storm exit)
            {"halt": false}                resume (also ends a manual flatten)
-           {"pause": ["GRID"]}            stop trading these symbols   {"resume": ["GRID"]} trade them again
+           {"pause": ["GRID"]}            stop trading these symbols   {"resume": ["GRID"]} trade them again ("all": all)
+                                          (a stock frozen by an announcement is recalibrated first; during a storm
+                                          that and the resume wait for the next round start)
            {"close": ["ARCH"]}            close these positions within 1% of mid
            {"flatten": true}              close every position within 1% of mid (retried from the current mid every 20 s
                                           until flat), then stay halted
            {"sniper": false} / {"follow": false} / {"stubs": true}   switch the extra strategies
+           {"announce": ["GEN"]}          run the announcement handling for GEN (freeze, go flat, remember the gap for
+                                          the recalibration) -- for an announcement the bot missed in a disconnect
+           {"fair": {"GEN": -3}}          optional override: shift our valuation of GEN by -$3/share for the rest of the
+                                          season instead of the automatic recalibration (0 clears; ETFs follow)
            {"sleeve": 0} / {"sleeve": 0.2}  formation sleeve size (fraction of limits). 0 = no new sleeve entries from
                                           now on; a sleeve position already held is still closed by its exit if the
                                           storm has formed, otherwise it is treated like any leftover position"""
         while True:
             await asyncio.sleep(2)
+            cmd = read_control(control, log)
+            if cmd is None:
+                continue
             try:
-                if not control.exists():
-                    continue
-                cmd = json.loads(control.read_text())
-                control.unlink()
-            except (OSError, ValueError) as exc:
-                log("control file error", error=repr(exc)); continue
-            if "halt" in cmd:
-                strat.halted, strat.flattening = bool(cmd["halt"]), False
-                if strat.halted:
-                    strat.broker.set_targets({x: (strat.broker.position(x), None, 0.0) for x in strat.quotes}, reason="manual halt")
-            if "sleeve" in cmd:
-                strat.form_frac = max(0.0, min(1.0, float(cmd["sleeve"])))
-                if strat.form_frac == 0.0 and strat.sleeve and strat.sleeve["state"] in ("wait", "entry"):
-                    strat.sleeve["state"] = "done"              # stop entering now; held sleeve positions go to the model
-                    strat.broker.set_targets({x: (strat.broker.position(x), None, 0.0) for x in strat.sleeve["targets"]},
-                                             reason="formation sleeve stopped")
-            for flag, attr in (("sniper", "sniper_on"), ("follow", "follow_on"), ("stubs", "stubs_on")):
-                if flag in cmd:
-                    setattr(strat, attr, bool(cmd[flag]))
-            strat.paused |= set(cmd.get("pause", []))
-            strat.paused -= set(cmd.get("resume", []))
-            if cmd.get("close"):                                    # close specific symbols within 1% of mid
-                goals = {}
-                for x in cmd["close"]:
-                    q = strat.broker.position(x)
-                    if q and x in strat.quotes:
-                        m_ = sum(strat.quotes[x]) / 2
-                        goals[x] = (0, m_ * 1.01 if q < 0 else m_ * 0.99, abs(q) * m_)
-                strat.broker.set_targets(goals, reason="manual close", urgent=True)
-            if cmd.get("flatten"):
-                strat.manual_flatten()
-            log("CONTROL", cmd=cmd, halted=strat.halted, paused=sorted(strat.paused))
+                apply_control(strat, cmd, log)
+            except Exception as exc:                       # a bad command must never stop the control loop (the brake)
+                log("control command error", cmd=cmd, error=repr(exc))
 
     async def tick_loop():
         while True:

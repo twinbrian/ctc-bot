@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from engine import Storm, Season, features, exact_values, SYMS, STOCKS
+from engine import Storm, Season, features, exact_values, value_with, N_SITES, SYMS, STOCKS
 
 EDGE_SHARE = 0.7                        # pay at most this fraction of the predicted move to enter (tested 0.3-1.0 on two
                                         # held-out sets: 0.5 -> $8,293/$8,619, 0.7 -> $8,800/$9,249, plateau to 0.85)
@@ -29,6 +29,13 @@ BUFFER = 0.01                           # enter only if half the predicted move 
 EXIT_MARGIN = 0.0015                    # after the storm, close within 0.15% of the model's fair value
 REPORT_EXIT_MARGIN = 0.003              # after a damage report the house quote is fair again: close within 0.3% of mid
 LEFTOVER_RETRY = 20.0                   # rounds 1-2: after a report, retry a stuck exit from the current mid this often (s)
+ANNOUNCE_CLOSE = 0.01                   # announcement: close the frozen stocks/ETFs within 1% of the current mid, retried
+# Announcement recalibration (on {"resume": [...]}). Our valuation formulas don't know about the news, so after it the
+# model would see a fake gap between our value and the price for that company -- and that gap feeds every stock's
+# model (a 5-10% GEN repricing changes 6-10% of the OTHER stocks' decisions). On resume, our value of the stock is
+# shifted so its gap to the price is back where it was before the news. Measured only between storms (formula and
+# price comparable): a round start to the next moves this gap by a median 0.3% of price for GEN (HAVEN 2.6%), while
+# 60 s inside a storm moves it by up to 2-13%. So a resume asked for during a storm waits for the next round start.
 STORM_SYMS = [s for s in ("PORT", "ISLE", "AQUA", "GRID", "FERRY", "RECON", "MAT", "GEN", "HAVEN")]  # REIN: edge < cost
 SNIPE_MARGIN = {"PORT": 0.15, "GRID": 0.12, "FERRY": 0.12, "GEN": 0.12, "ARCH": 0.40, "REBLD": 0.25}
 DEFAULT_MARGIN = 0.05
@@ -93,7 +100,10 @@ class Strategy:
             self.form_dirs = {}
         # sniper OFF: replaying every recorded live book through it (bot/test_sniper_replay.py) lost money --
         # its fair-value estimate (house quote ladder) can be wrong and stuck, so 'mispriced' orders were mostly not.
-        self.sniper_on, self.follow_on, self.stubs_on = False, True, False
+        # follower OFF (2026-10-20): never tested (no announcements in any research season or on the testnet), and a
+        # race against every other team reading the same headline -- by 6 s the 'house move' may be their orders.
+        # An announcement still freezes the stock and its ETF. {"follow": true} in bot/control.json turns it on.
+        self.sniper_on, self.follow_on, self.stubs_on = False, False, False
         # first storm age at which the in-storm model may trade. At age 10 the model has no skill (out-of-sample R^2 ~ 0)
         # and the house still reprices 16-28 s after formation. Waiting for the first official advisory (age 30):
         #   seasons 501-600: $7,122 -> $8,264/season, P(season>0) 0.79 -> 0.86
@@ -109,6 +119,13 @@ class Strategy:
         self.hm_hist: dict = {}                             # symbol -> deque of (time, house mid)
         self.sighted: dict = {}                             # (symbol, side) -> (first time seen, price)
         self.follow: dict = {}                              # symbol -> announcement-follower state
+        self.closing: dict = {}                             # symbol -> last close attempt (clock): announcement close
+        self.announced: dict = {}                           # symbol -> storm object current at its announcement (or None)
+        self.gap_before: dict = {}                          # stock -> (our value minus price before the news, season no.)
+        self.round_gaps: dict = {}                          # stock -> that gap at the start of the current round
+        self.resume_pending: set = set()                    # resumes asked for during a storm: done at the next round start
+        self.fair_manual: set = set()                       # stocks with a manual {"fair"} since their announcement
+        self.season_no = 0
         self.n_decisions = 0
         self.storm_syms = list(STORM_SYMS)
         self.sym_buffer: dict = {}                          # symbol -> entry buffer overriding BUFFER (default: none)
@@ -162,6 +179,9 @@ class Strategy:
                 self.new_season("round-1 storm formed")
             self.storm = Storm(m["round"], m["storm"])
             self.Hpre = self.mids_at(2.0) or {}
+            if not self.replaying and self.Hpre:
+                self.round_gaps = self._raw_gaps({x: self.Hpre[x] for x in STOCKS if x in self.Hpre})
+                self._process_pending(self.round_gaps, "storm formed (round start; the market-open snapshot was missed)")
             self.fair = {}
             self.stopped_round = False
             self.report_t = None
@@ -210,10 +230,13 @@ class Strategy:
         elif typ == "snapshot":
             self._note_open(m)
             self.on_snapshot(m)
+            self._missed_announcements(m)
         elif typ == "announcement":
             # the company's economics changed: the valuation formulas may now be wrong for these symbols.
-            # Stop trading them (positions are held) until a human resumes them via bot/control.json.
+            # Stop trading them until a human resumes them via bot/control.json, and get flat in them: a position
+            # we can no longer value is a bet of unknown direction (closed patiently, see tick).
             syms = [x for x in (m.get("symbols") or []) if x in self.limits] or list(self.limits)
+            frozen_now = set(syms) | {x for x in ("ARCH", "REBLD") if any(y in BASKET_OF.get(x, ()) for y in syms)}
             self.paused |= set(syms)
             if self.sleeve:                                  # the sleeve stops working them: they are paused/followed now
                 for x in syms:
@@ -221,13 +244,53 @@ class Strategy:
             for x in ("ARCH", "REBLD"):                      # ETFs contain the paused stocks
                 if any(y in BASKET_OF.get(x, ()) for y in syms):
                     self.paused.add(x)
-            self.broker.set_targets({x: (self.broker.position(x), None, 0.0) for x in self.paused if x in self.quotes},
+            self.broker.set_targets({x: (self.broker.position(x), None, 0.0) for x in frozen_now if x in self.quotes},
                                     reason="announcement pause")
             now = self.clock()
             for x in syms:
                 if x in STOCKS and self.follow_on and not self.replaying and not self.halted:
                     self.follow[x] = {"t0": now, "h0": self.top_mid(x), "state": "watch", "base": self.broker.position(x)}
-            self.log("ANNOUNCEMENT - PAUSED", headline=m.get("headline"), symbols=syms, paused=sorted(self.paused))
+            # remember the gap before the news, for the recalibration on resume: just before it if it came between
+            # storms; otherwise -- and for a late manual {"announce"}, when the house has already moved -- the round's
+            # start. Replaying the recorded feed after a restart nothing can be measured: None -> the fallback.
+            st_now = self.storm if self.storm is not None and not self.storm.dissipated else None
+            quiet = self._quiet() and not m.get("manual") and not self.replaying
+            now_gaps = self._raw_gaps() if quiet else {}
+            for x in syms:
+                self.announced[x] = st_now
+                self.fair_manual.discard(x)
+                self.resume_pending.discard(x)                  # news again: a pending resume needs a new decision
+                if x in STOCKS and x not in self.gap_before:      # several announcements: the earliest gap counts
+                    g = None if self.replaying else (now_gaps.get(x) if quiet else self.round_gaps.get(x))
+                    if g is None and m.get("manual") and not self.replaying:
+                        g = self._raw_gaps().get(x) if self._quiet() else None   # no round start known: best effort
+                    self.gap_before[x] = (g, self.season_no)
+            closing = {x: self.broker.position(x) for x in frozen_now      # only what THIS announcement froze: a stock
+                       if self.broker.position(x) and x not in self.follow}   # a human trades from an earlier one stays
+            if closing and not self.replaying:                  # with the brake on, it closes once the brake is released
+                for x in closing:
+                    self.closing[x] = -1e9                      # first attempt on the next tick (within 1 s)
+            self.log("ANNOUNCEMENT - PAUSED", headline=m.get("headline"), symbols=syms, paused=sorted(self.paused),
+                     closing=closing if not self.replaying else {}, halted=self.halted)
+
+    def _missed_announcements(self, m):
+        """The feed does not resend messages missed while disconnected, but every snapshot lists the last 8 headline
+        messages. An announcement there that we never received: handled as usual if it names its symbols; if it does
+        not (snapshot headline entries are summaries), nothing is frozen automatically -- an ALERT gives the headline,
+        and {"announce": ["<ticker>"]} in bot/control.json runs the usual handling for the stocks a human names."""
+        for h in m.get("headlines") or []:
+            if h.get("type") != "announcement" or h.get("seq") is None:
+                continue
+            key = (str(h.get("time", ""))[:10], h["seq"])
+            if key in self.seen:
+                continue
+            if h.get("symbols"):
+                self.on_news(dict(h))                        # marks it seen
+            elif not self.replaying:                         # at start-up, the live snapshot that follows alerts it
+                self.seen.add(key)
+                self.log("ANNOUNCEMENT MISSED - SEEN ONLY IN A SNAPSHOT", headline=h.get("headline"), seq=h["seq"],
+                         note='its tickers are not in the snapshot: nothing frozen. If it affects a stock, send '
+                              '{"announce": ["<ticker>"]}')
 
     # ---- other participants: house fair value, mispriced orders, announcements, stubs ------------------------
     def top_mid(self, s):
@@ -323,6 +386,8 @@ class Strategy:
         self.round_open = (self.clock() - el, m.get("round"), key)
         self.sleeve = {"state": "wait", "round": m.get("round"), "last": -1e9, "targets": {}} if self.form_frac > 0 else None
         self.log("market open", round=m.get("round"), seconds_since_open=round(el, 1), sleeve=self.form_frac)
+        if self.resume_pending:
+            self._process_pending(self._raw_gaps(), "round start")
 
     def _sleeve_tick(self, now):
         sl = self.sleeve
@@ -377,6 +442,100 @@ class Strategy:
                 if goals:
                     self.broker.set_targets(goals, reason="formation sleeve exit")
 
+    def _quiet(self) -> bool:
+        """Between storms with the last storm's final report in: our formula and the house price are comparable."""
+        st = self.storm
+        return st is None or (st.dissipated and st.round in self.season.finals)
+
+    def _raw_gaps(self, prices=None) -> dict:
+        """Per stock: our formula's value between storms (damage so far + the storms still to come; announcement shifts
+        NOT included) minus the price. Prices: the current mids unless given."""
+        prices = prices if prices is not None else {x: self.top_mid(x) for x in STOCKS}
+        try:
+            v = value_with(self.season, self.consts, np.zeros(N_SITES), np.zeros(N_SITES), max(0, 3 - len(self.season.finals)))
+        except Exception as exc:                            # a measurement must never break trading
+            self.log("error", where="announcement gaps", error=repr(exc))
+            return {}
+        return {x: v[x] - self.season.value_offset.get(x, 0.0) - px for x, px in prices.items() if px and x in v}
+
+    def _recalibrate(self, x, gap_after, where):
+        """Shift our value of x so its gap to the price is back where it was before the news."""
+        gb, sno = self.gap_before.pop(x, (None, None))
+        old = self.season.value_offset.get(x, 0.0)
+        if sno != self.season_no or gap_after is None:
+            self.log("ANNOUNCEMENT - RECALIBRATED", symbol=x, shift=old, note="not measured (new season, or no price)")
+            return
+        if gb is None:                                       # e.g. the bot restarted after the news
+            new, note = -gap_after, "no measurement from before the news: our value set to the market price"
+        else:
+            new, note = old + (gb - gap_after), "our value's gap to the price restored to its level before the news"
+        if abs(new) > 1e-9:
+            self.season.value_offset[x] = new
+        else:
+            self.season.value_offset.pop(x, None)
+        self.log("ANNOUNCEMENT - RECALIBRATED", symbol=x, shift=round(new, 3), previous=round(old, 3), where=where,
+                 gap_before=None if gb is None else round(gb, 3), gap_after=round(gap_after, 3), note=note)
+
+    def _unfreeze(self, x):
+        self.paused.discard(x)
+        self.closing.pop(x, None)
+        self.resume_pending.discard(x)
+        self.log("RESUMED", symbol=x)
+
+    def _process_pending(self, gaps, where):
+        """Resumes asked for during a storm: recalibrate and unfreeze at the round start (an ETF with its stocks)."""
+        for x in sorted(self.resume_pending):
+            if x in STOCKS:
+                if x in self.gap_before:
+                    self._recalibrate(x, gaps.get(x), where)
+                self._unfreeze(x)
+        for x in sorted(self.resume_pending):
+            if not any(c in self.gap_before or c in self.resume_pending for c in BASKET_OF.get(x, ())):
+                self._unfreeze(x)
+
+    def resume(self, syms):
+        """{"resume": [...]}: unfreeze. A stock frozen by an announcement is recalibrated first. Between storms that is
+        done at once; during a storm the measurement would be noisy, so the stock stays frozen and both happen at the
+        next round start. An ETF frozen with a stock resumes with it. After a manual {"fair"}, resume is immediate."""
+        quiet = self._quiet()
+        gaps = self._raw_gaps() if quiet else {}
+        for x in syms:
+            if x not in self.limits:
+                continue
+            self.closing.pop(x, None)
+            if x in self.gap_before:
+                if quiet:
+                    self._recalibrate(x, gaps.get(x), "resume between storms")
+                    self._unfreeze(x)
+                else:
+                    self.resume_pending.add(x)
+                    self.log("ANNOUNCEMENT - RESUME SCHEDULED", symbol=x,
+                             note="a storm is running: recalibrated and resumed at the next round start")
+            elif any(c in self.gap_before or c in self.resume_pending for c in BASKET_OF.get(x, ())):
+                self.resume_pending.add(x)
+                self.log("ANNOUNCEMENT - RESUME SCHEDULED", symbol=x, note="an ETF: resumes with its frozen stocks")
+            else:
+                self._unfreeze(x)
+        for x in sorted(self.resume_pending):               # ETFs whose stocks were just recalibrated
+            if x not in STOCKS and not any(c in self.gap_before or c in self.resume_pending for c in BASKET_OF.get(x, ())):
+                self._unfreeze(x)
+
+    def set_fair(self, s: str, value: float):
+        """Shift our valuation of `s` by `value` $/share for the rest of the season (0 clears). If the announcement
+        came during the current storm, the pre-storm price input moves with it, so the model's 'move since the storm
+        formed' input does not count the news as storm news."""
+        old = self.season.value_offset.get(s, 0.0)
+        if value:
+            self.season.value_offset[s] = float(value)
+        else:
+            self.season.value_offset.pop(s, None)
+        self.fair_manual.add(s)                              # the human's number replaces the automatic recalibration
+        self.gap_before.pop(s, None)
+        st = self.storm
+        if st is not None and not st.dissipated and self.announced.get(s) is st and s in (self.Hpre or {}):
+            self.Hpre[s] += float(value) - old
+        self.log("FAIR ADJUSTED", symbol=s, offset=float(value), previous=old, offsets=dict(self.season.value_offset))
+
     def tick(self):
         """Called every second by live.py: snipe unwinds, the announcement follower, stub quotes."""
         if self.replaying:
@@ -417,6 +576,18 @@ class Strategy:
                 if cur != base:
                     cap = hm * (1 + 0.003) if base > cur else hm * (1 - 0.003)
                     self.broker.set_targets({s: (base, cap, 1e9)}, reason="unwind snipe")
+        # 1b. announcement: close the frozen stocks/ETFs from the current mid, every LEFTOVER_RETRY s until flat; then
+        #     HOLD, so a position a human opens by hand afterwards is left alone
+        for s, last in list(self.closing.items()):
+            p = self.broker.position(s)
+            if not p:
+                self.closing.pop(s)
+                self.broker.set_targets({s: (0, None, 0.0)}, reason="announcement: flat, hold")
+                self.log("ANNOUNCEMENT - FLAT", symbol=s)
+            elif now - last >= LEFTOVER_RETRY and s in self.quotes:
+                self.closing[s] = now
+                mid = sum(self.quotes[s]) / 2; d = 1 if p > 0 else -1
+                self.broker.set_targets({s: (0, mid * (1 - d * ANNOUNCE_CLOSE), abs(p) * mid)}, reason="announcement: close", urgent=True)
         # 2. announcement follower: the house takes ~45 s to adjust; follow the direction of its first 6 s
         for s, f in list(self.follow.items()):
             hm = self.top_mid(s)
@@ -462,7 +633,12 @@ class Strategy:
         """A new season (the testnet replays one after another): positions are reset by the exchange."""
         self.last_news_t = self.clock()                     # the whole book reprices at a season change
         self.snipes, self.sighted = {}, {}
-        self.season = Season()
+        if self.resume_pending:                              # asked to resume: no recalibration across seasons
+            for x in sorted(self.resume_pending):
+                self._unfreeze(x)
+        self.season = Season()                              # also clears the season's fair adjustments
+        self.announced, self.gap_before, self.round_gaps, self.fair_manual = {}, {}, {}, set()
+        self.season_no += 1
         self.storm, self.in_storm_syms, self.final_values, self.fair = None, set(), None, {}
         self.season_date = None
         self.broker.clear()

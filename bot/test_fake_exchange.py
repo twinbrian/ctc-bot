@@ -138,9 +138,16 @@ def main():
     refresh(); st.on_book(SYM); wait(1.0, refresh)
     check("3 no snipe right after news", fx.pos == 0, f"pos {fx.pos}")
 
-    # 4. announcement follower: house moves +2% in the first seconds -> follow (half limit), then exit
+    # 4. announcement follower (OFF by default): house moves +2% in the first seconds -> follow (half limit), exit
     S.FOLLOW_WAIT, S.FOLLOW_HOLD = 1.0, 3.0
     fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.on_news({"type": "announcement", "round": 1, "storm": "X", "time": "2025-08-04T11:00:00", "headline": "test",
+                "symbols": [SYM], "seq": 1})
+    fx.mid = 40.8; wait(2.5, lambda: (refresh(), st.tick()))
+    check("4 follower off by default: the announcement freezes the symbol and nothing is traded",
+          SYM in st.paused and not st.follow_on and fx.pos == 0 and not fx.trades, f"pos {fx.pos}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.follow_on = True                                        # the follower's mechanics, when switched on
     st.on_news({"type": "announcement", "round": 1, "storm": "X", "time": "2025-08-04T11:00:00", "headline": "test",
                 "symbols": [SYM], "seq": 1})
     check("4a announcement pauses the symbol", SYM in st.paused)
@@ -196,7 +203,7 @@ def main():
     st.report_t = time.monotonic(); st.last_flatten_t = -1e9
     wait(2.5, lambda: (refresh(), st.tick()))
     check("9b halted: no leftover re-flatten", fx.pos == -50 and not [e for e, _ in ev if e == "order"], f"pos {fx.pos}")
-    S.FOLLOW_WAIT = 1.0
+    S.FOLLOW_WAIT = 1.0; st.follow_on = True                   # even with the follower on, the brake stops it
     st.on_news({"type": "announcement", "round": 1, "storm": "X", "time": "2025-08-04T11:00:00", "headline": "test",
                 "symbols": [SYM], "seq": 2})
     fx.mid = 40.8; wait(2.5, lambda: (refresh(), st.tick()))
@@ -263,8 +270,10 @@ def main():
     st.on_news({"type": "announcement", "symbols": [SYM], "headline": "test announcement", "time": "2025-08-04T09:50:00"})
     st.on_news({"type": "storm_formed", "round": 1, "storm": "X", "time": "2025-08-04T10:00:00", "seq": 1, "headline": "formed"})
     st.on_news(obs(0, 2)); st.on_news(obs(12, 3)); wait(3.5, lambda: (refresh(), st.tick()))
-    check("11g announcement: the sleeve drops the symbol and does not trade it any more (paused, follower's call)",
-          held == tgt and fx.pos == held and SYM not in st.sleeve["targets"] and SYM in st.paused, f"held {held}, pos {fx.pos}")
+    sleeve_exits = [kw for e, kw in ev if e == "order" and "sleeve exit" in str(kw.get("reason"))]
+    check("11g announcement: the sleeve drops the symbol; the announcement rule (not the sleeve) closes it to flat",
+          held == tgt and fx.pos == 0 and SYM not in st.sleeve["targets"] and SYM in st.paused and not sleeve_exits,
+          f"held {held}, pos {fx.pos}, sleeve exit orders {len(sleeve_exits)}")
     # a manual pause ({"pause": [...]} in control.json) is respected by the sleeve's exit too
     fx = FakeExchange(); st, b, ev, refresh = setup(fx)
     st.form_frac = 0.2
@@ -274,6 +283,224 @@ def main():
     st.on_news({"type": "storm_formed", "round": 1, "storm": "X", "time": "2025-08-04T10:00:00", "seq": 1, "headline": "formed"})
     st.on_news(obs(0, 2)); st.on_news(obs(12, 3)); wait(3.5, lambda: (refresh(), st.tick()))
     check("11h manual pause: the sleeve's exit leaves the paused symbol alone", held == tgt and fx.pos == held, f"held {held}, pos {fx.pos}")
+
+    # 13. announcement: get flat in the frozen stock (within 1% of mid, retried from the current mid), then hold
+    ann = lambda q: {"type": "announcement", "round": 1, "storm": "X", "time": "2025-08-04T11:00:00", "headline": "test",
+                     "symbols": [SYM], "seq": q}
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    fx.pos, fx.avg = -50, 40.0; wait(1.2, refresh)
+    st.on_news(ann(3)); wait(2.5, lambda: (refresh(), st.tick()))
+    check("13a announcement: the frozen stock is closed to flat within 1% of mid",
+          fx.pos == 0 and SYM in st.paused and fx.trades and all(abs(t["price"] / 40 - 1) <= 0.01 for t in fx.trades),
+          f"pos {fx.pos}, trades {[(t['side'], t['quantity'], t['price']) for t in fx.trades]}")
+    wait(1.5, lambda: (refresh(), st.tick()))
+    n = len(fx.trades); fx.pos, fx.avg = 30, 40.0                 # then a human buys 30 by hand
+    wait(3.0, lambda: (refresh(), st.tick()))
+    check("13b once flat it holds: a position opened by hand afterwards is left alone",
+          fx.pos == 30 and len(fx.trades) == n and SYM not in st.closing, f"pos {fx.pos}, closing {st.closing}")
+    keep = S.LEFTOVER_RETRY; S.LEFTOVER_RETRY = 2.0
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    fx.pos, fx.avg = -50, 40.0; wait(1.2, refresh)
+    fx.mid = 41.5; st.quotes[SYM] = (39.95, 40.05)               # the bot still sees the old price: a stale 1% cap
+    st.on_news(ann(4)); st.tick(); wait(0.6, refresh)
+    check("13c the first close from a stale price does not fill", fx.pos == -50, f"pos {fx.pos}")
+    wait(3.0, lambda: (refresh(), st.tick())); wait(1.0, refresh)
+    check("13d retried from the current mid until flat", fx.pos == 0, f"pos {fx.pos}")
+    S.LEFTOVER_RETRY = keep
+
+    # 14. valuation shift for an announced company (automatic on resume, or {"fair"} by hand); ETFs follow
+    import numpy as np
+    import engine as E
+    z = np.zeros(E.N_SITES)
+    sea = E.Season(); v0 = E.value_with(sea, st.consts, z, z, 3)
+    sea.finals = {1: {c: 10.0 for c in E.PHYS}}; x0 = E.exact_values(sea, None)
+    sea.value_offset = {"GEN": -3.0}
+    v1 = E.value_with(sea, st.consts, z, z, 3); x1 = E.exact_values(sea, None)
+    same = lambda a_, b_: all(abs(a_[k] - b_[k]) < 1e-9 for k in a_ if k not in ("GEN", "REBLD"))
+    check("14a GEN shifted -$3: GEN and REBLD (1 GEN per share) -3 in both the model's values and the settlement "
+          "values, every other symbol unchanged", abs(v1["GEN"] - v0["GEN"] + 3) < 1e-9 and abs(v1["REBLD"] - v0["REBLD"] + 3) < 1e-9
+          and abs(x1["GEN"] - x0["GEN"] + 3) < 1e-9 and abs(x1["REBLD"] - x0["REBLD"] + 3) < 1e-9 and same(v0, v1) and same(x0, x1))
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.set_fair(SYM, -1.0)
+    check("14b {\"fair\": ...} by hand: the season's valuation of the stock moves by it", st.season.value_offset == {SYM: -1.0},
+          f"offsets {st.season.value_offset}")
+    st.set_fair(SYM, 0); cleared = not st.season.value_offset
+    st.set_fair(SYM, -2.0); st.new_season("test")
+    check("14c 0 clears it, and a new season starts with none", cleared and not st.season.value_offset, f"offsets {st.season.value_offset}")
+
+    # 15. resume after an announcement recalibrates: our value's gap to the price goes back to its level before the news
+    gap = lambda st_, k: E.value_with(st_.season, st_.consts, z, z, k)[SYM]          # our formula between storms
+    all_quotes = lambda st_: [st_.on_quote(x, 49.95, 50.05) for x in S.SYMS if x != SYM] + [st_.on_quote(SYM, 39.95, 40.05)]
+    formed = {"type": "storm_formed", "round": 1, "storm": "X", "time": "2025-08-04T10:00:00", "seq": 1, "headline": "formed"}
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)                 # 15a: between storms -> at once
+    st.on_news(ann(6)); fx.mid = 39.0; refresh()                         # the house reprices GRID by -$1
+    st.resume([SYM, "ARCH"])
+    check("15a between storms: resume recalibrates at once (-$1, the house's move) and unfreezes the stock and its ETF",
+          abs(st.season.value_offset.get(SYM, 0) + 1.0) < 1e-6 and SYM not in st.paused and "ARCH" not in st.paused,
+          f"offsets {st.season.value_offset}, paused {sorted(st.paused)}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)                 # 15b-c: during a storm -> next round start
+    all_quotes(st); st.on_news(formed); st.on_news(obs(0, 2))
+    v0 = gap(st, 3)
+    st.on_news(ann(6)); fx.mid = 39.0; refresh(); st.on_quote(SYM, 38.95, 39.05)
+    st.resume([SYM, "ARCH"])
+    check("15b during a storm: the resume is scheduled; the stock and its ETF stay frozen",
+          SYM in st.paused and "ARCH" in st.paused and st.resume_pending == {SYM, "ARCH"}, f"pending {st.resume_pending}")
+    st.storm.dissipated = True; st.season.finals[1] = {c: 0.0 for c in E.PHYS}    # the storm ended, final report in
+    v1 = gap(st, 2)
+    st.on_news({"type": "snapshot", "phase": "pre_storm", "round": 2, "storm": "Y", "time": "2025-08-04T09:45:00", "damage": []})
+    want = (v0 - 40.0) - (v1 - 39.0)                                     # = house move - formula move
+    check("15c at the next round start it recalibrates (house move minus our formula's move) and resumes both",
+          abs(st.season.value_offset.get(SYM, 0) - want) < 1e-6 and SYM not in st.paused and "ARCH" not in st.paused
+          and not st.resume_pending, f"offset {st.season.value_offset.get(SYM)}, want {want:.4f}, paused {sorted(st.paused)}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)                 # 15d: a manual fair wins, resume at once
+    all_quotes(st); st.on_news(formed); st.on_news(obs(0, 2)); st.on_news(ann(6))
+    st.set_fair(SYM, -2.0); st.resume([SYM])
+    check("15d with a manual {\"fair\"}, resume is immediate even mid-storm and keeps that number",
+          SYM not in st.paused and st.season.value_offset == {SYM: -2.0}, f"paused {sorted(st.paused)}, offsets {st.season.value_offset}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)                 # 15e: no pre-news measurement (a restart)
+    st.on_news(formed); st.on_news(obs(0, 2)); st.on_news(ann(6))       # no quotes for the other stocks: no round gaps
+    st.storm.dissipated = True; st.season.finals[1] = {c: 0.0 for c in E.PHYS}
+    st.resume([SYM])
+    check("15e no measurement from before the news (e.g. a restart): our value is set to the market price",
+          abs(gap(st, 2) - st.top_mid(SYM)) < 1e-6 and SYM in st.season.value_offset and SYM not in st.paused,   # value incl. the shift
+          f"offset {st.season.value_offset}")
+
+    # 16. the commands as typed into bot/control.json on the day (live.apply_control: the bot's own handler)
+    import live as LV
+    clog = []
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    LV.apply_control(st, {"pause": "GRID"}, lambda e, **kw: clog.append(e))
+    check("16a {\"pause\": \"GRID\"} (a single name, not a list) pauses GRID", "GRID" in st.paused, f"paused {sorted(st.paused)}")
+    LV.apply_control(st, {"resume": "GRID"}, lambda e, **kw: clog.append(e))
+    check("16b {\"resume\": \"GRID\"} resumes it", "GRID" not in st.paused, f"paused {sorted(st.paused)}")
+    st.on_news(ann(7)); fx.mid = 39.0; refresh()
+    LV.apply_control(st, {"resume": ["GRID", "ARCH"]}, lambda e, **kw: clog.append(e))
+    check("16c after an announcement, {\"resume\": [\"GRID\", \"ARCH\"]} between storms recalibrates (-$1) and resumes both",
+          abs(st.season.value_offset.get("GRID", 0) + 1.0) < 1e-6 and not ({"GRID", "ARCH"} & st.paused), f"offsets {st.season.value_offset}")
+    try:
+        LV.apply_control(st, {"fair": {"GRID": "minus three"}}, lambda e, **kw: clog.append(e)); raised = False
+    except ValueError:
+        raised = True
+    check("16d a malformed command raises (the control loop catches it, logs 'control command error' and keeps going)", raised)
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    all_quotes(st); st.on_news(formed); st.on_news(obs(0, 2)); st.on_news(ann(8))
+    LV.apply_control(st, {"fair": {"GRID": -3}, "resume": ["GRID"]}, lambda e, **kw: clog.append(e))
+    check("16e {\"fair\": {\"GRID\": -3}, \"resume\": [\"GRID\"]} mid-storm: fair first, then an immediate resume",
+          "GRID" not in st.paused and st.season.value_offset == {"GRID": -3.0}, f"paused {sorted(st.paused)}, offsets {st.season.value_offset}")
+    LV.apply_control(st, {"halt": True}, lambda e, **kw: clog.append(e)); h1 = st.halted
+    LV.apply_control(st, {"halt": False}, lambda e, **kw: clog.append(e))
+    check("16f the brake: {\"halt\": true} / {\"halt\": false}", h1 and not st.halted and clog.count("CONTROL") == 6, f"log {clog}")
+
+    # 17. a second announcement on the same stock after the first was resumed: a fresh cycle, the shifts add up
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.on_news(ann(9)); fx.mid = 39.0; refresh(); LV.apply_control(st, {"resume": ["GRID", "ARCH"]}, lambda e, **kw: None)
+    first = st.season.value_offset.get("GRID", 0)
+    st.on_news(ann(10)); refaced = "GRID" in st.paused and "ARCH" in st.paused
+    fx.mid = 37.0; refresh(); LV.apply_control(st, {"resume": ["GRID", "ARCH"]}, lambda e, **kw: None)
+    check("17 a second announcement later: frozen again, then resume adds its -$2 to the first -$1 (total -$3)",
+          abs(first + 1.0) < 1e-6 and refaced and abs(st.season.value_offset.get("GRID", 0) + 3.0) < 1e-6
+          and not ({"GRID", "ARCH"} & st.paused), f"first {first}, total {st.season.value_offset}")
+
+    # 18. a later announcement closes only what IT froze; a missed announcement in a snapshot; the "announce" command
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.on_news(ann(11)); wait(1.5, lambda: (refresh(), st.tick()))        # GRID frozen (flat)
+    fx.pos, fx.avg = 30, 40.0; wait(1.2, refresh)                          # a human now trades GRID by hand
+    st.on_news({"type": "announcement", "round": 1, "storm": "X", "time": "2025-08-04T11:05:00", "headline": "PORT news",
+                "symbols": ["PORT"], "seq": 12})
+    wait(2.5, lambda: (refresh(), st.tick()))
+    check("18a a second announcement (PORT) does not close the GRID position a human is trading from the first",
+          fx.pos == 30 and "PORT" in st.paused and "GRID" in st.paused, f"pos {fx.pos}, paused {sorted(st.paused)}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    fx.pos, fx.avg = -50, 40.0; wait(1.2, refresh)
+    snap = lambda hl: {"type": "snapshot", "phase": "storm", "round": 1, "storm": "X", "time": "2025-08-04T11:10:00",
+                       "damage": [], "headlines": hl}
+    st.on_news(snap([{"type": "announcement", "round": 1, "time": "2025-08-04T11:06:00", "headline": "GRID news",
+                      "symbols": ["GRID"], "seq": 20}]))
+    wait(2.5, lambda: (refresh(), st.tick()))
+    check("18b an announcement we missed, seen in a snapshot with its symbols: handled as usual (frozen, flat)",
+          SYM in st.paused and fx.pos == 0, f"pos {fx.pos}, paused {sorted(st.paused)}")
+    st.on_news(snap([{"type": "announcement", "round": 1, "time": "2025-08-04T11:06:00", "headline": "GRID news",
+                      "symbols": ["GRID"], "seq": 20}]))
+    n_ann = sum(1 for e, _ in ev if e == "ANNOUNCEMENT - PAUSED")
+    check("18c the same headline in the next snapshot is not handled twice", n_ann == 1, f"handled {n_ann} times")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)
+    st.on_news(snap([{"type": "announcement", "round": 1, "time": "2025-08-04T11:06:00", "headline": "A government action",
+                      "seq": 21}]))
+    missed = [kw for e, kw in ev if e == "ANNOUNCEMENT MISSED - SEEN ONLY IN A SNAPSHOT"]
+    check("18d a missed announcement without symbols: nothing frozen, the headline is reported (ALERT)",
+          not st.paused and len(missed) == 1 and missed[0]["headline"] == "A government action", f"paused {sorted(st.paused)}")
+    fx.pos, fx.avg = -50, 40.0; wait(1.2, refresh)
+    LV.apply_control(st, {"announce": "GRID"}, lambda e, **kw: None); wait(2.5, lambda: (refresh(), st.tick()))
+    check("18e {\"announce\": \"GRID\"} runs the usual handling: frozen with its ETF, flat, gap remembered",
+          SYM in st.paused and "ARCH" in st.paused and fx.pos == 0 and SYM in st.gap_before, f"pos {fx.pos}, paused {sorted(st.paused)}")
+    try:
+        LV.apply_control(st, {"announce": ["GRDI"]}, lambda e, **kw: None); typo_raised = False
+    except ValueError:
+        typo_raised = True
+    check("18f a typo in announce is rejected (it must not freeze everything)", typo_raised and st.paused == {SYM, "ARCH"},
+          f"paused {sorted(st.paused)}")
+
+    # 19. full review fixes: restart fallback, brake, late manual announce, resume all, the ctl helper, monitor
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)                   # 19a restart: the announcement is replayed
+    st.replaying = True; st.on_news(ann(13)); st.replaying = False
+    marked = st.gap_before.get(SYM) == (None, st.season_no) and SYM in st.paused
+    fx.mid = 39.0; refresh(); LV.apply_control(st, {"resume": [SYM, "ARCH"]}, lambda e, **kw: None)
+    check("19a after a restart (announcement replayed): resume still recalibrates, to the market price",
+          marked and abs(gap(st, 3) - st.top_mid(SYM)) < 1e-6 and not ({SYM, "ARCH"} & st.paused), f"offsets {st.season.value_offset}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)                   # 19b the brake is on at the announcement
+    fx.pos, fx.avg = -50, 40.0; wait(1.2, refresh)
+    st.halted = True; st.on_news(ann(14)); wait(2.5, lambda: (refresh(), st.tick()))
+    held = fx.pos
+    st.halted = False; wait(2.5, lambda: (refresh(), st.tick()))
+    check("19b with the brake on, nothing is closed; once released, the announced stock is closed to flat",
+          held == -50 and fx.pos == 0, f"while halted {held}, after {fx.pos}")
+    fx = FakeExchange(); st, b, ev, refresh = setup(fx)                   # 19c a late manual announce, between storms
+    all_quotes(st); st.on_news(formed); st.on_news(obs(0, 2)); start_gap = st.round_gaps.get(SYM)
+    st.storm.dissipated = True; st.season.finals[1] = {c: 0.0 for c in E.PHYS}
+    fx.mid = 38.0; refresh(); st.on_quote(SYM, 37.95, 38.05)              # the house already moved: we missed it
+    LV.apply_control(st, {"announce": [SYM]}, lambda e, **kw: None)
+    check("19c a manual announce (late) remembers the round-start gap, from before the news, not the gap now",
+          start_gap is not None and st.gap_before.get(SYM, (None,))[0] == start_gap, f"{st.gap_before.get(SYM)} vs {start_gap}")
+    LV.apply_control(st, {"resume": "all"}, lambda e, **kw: None)
+    check("19d {\"resume\": \"all\"} resumes everything frozen", not st.paused, f"paused {sorted(st.paused)}")
+    import ctl
+    built = [ctl.build(a) for a in (["resume", "gen", "rebld"], ["resume", "ALL"], ["announce", "GEN"], ["fair", "GEN", "-3"],
+                                     ["halt"], ["go"])]
+    bad = 0
+    for a in (["resume"], ["fair", "GEN"], ["bogus"]):
+        try:
+            ctl.build(a)
+        except ValueError:
+            bad += 1
+    import tempfile, threading as _th
+    tmpd = Path(tempfile.mkdtemp()); cpath = tmpd / "control.json"
+    taken = []
+    def bot_reads():                                                      # plays the bot: read and delete once
+        for _ in range(100):
+            if cpath.exists():
+                taken.append(json.loads(cpath.read_text())); cpath.unlink(); return
+            time.sleep(0.05)
+    _th.Thread(target=bot_reads).start(); sent_ok = ctl.send({"resume": ["GEN"]}, cpath, 2, 5)
+    check("19e ctl.py: builds the commands, rejects bad ones, and writes atomically for the bot to pick up",
+          built == [{"resume": ["GEN", "REBLD"]}, {"resume": "all"}, {"announce": ["GEN"]}, {"fair": {"GEN": -3.0}},
+                    {"halt": True}, {"halt": False}] and bad == 3 and sent_ok and taken == [{"resume": ["GEN"]}], f"{built} {bad} {taken}")
+    import watch as WT
+    class _D: pass
+    d_ = _D(); d_.events = [(10, "ANNOUNCEMENT - PAUSED", {"paused": ["GEN", "REBLD"]}), (20, "RESUMED", {"symbol": "REBLD"}),
+                            (30, "CONTROL", {"paused": ["GEN", "PORT"]}), (40, "RESUMED", {"symbol": "GEN"})]
+    check("19f monitor: knows which stocks are frozen (so manual trades in them are not blamed on the bot)",
+          WT.frozen_at(d_, 15) == {"GEN", "REBLD"} and WT.frozen_at(d_, 25) == {"GEN"} and WT.frozen_at(d_, 35) == {"GEN", "PORT"}
+          and WT.frozen_at(d_, 45) == {"PORT"})
+
+    # 20. reading bot/control.json: a malformed file is consumed and reported; the next command goes through
+    tmpd = Path(tempfile.mkdtemp()); cf = tmpd / "control.json"; elog = []
+    cf.write_text('{"resume": ["GEN"'); r1 = LV.read_control(cf, lambda e, **kw: elog.append(e)); gone1 = not cf.exists()
+    cf.write_text('["halt"]'); r2 = LV.read_control(cf, lambda e, **kw: elog.append(e)); gone2 = not cf.exists()
+    cf.write_text('{"halt": true}'); r3 = LV.read_control(cf, lambda e, **kw: elog.append(e))
+    r4 = LV.read_control(cf, lambda e, **kw: elog.append(e))
+    check("20 control file: broken JSON and a non-object are consumed and reported, the next command is read, no file = none",
+          r1 is None and gone1 and r2 is None and gone2 and r3 == {"halt": True} and r4 is None
+          and elog == ["control file error", "control file error"], f"{r1} {r2} {r3} {r4} {elog}")
 
     print("\nALL PASSED" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1
